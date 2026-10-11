@@ -91,12 +91,77 @@ pub fn upright_box(rotation: i64, at: [f64; 2], width: f64, height: f64) -> Opti
 pub const MAX_SIGNATURE_IMAGE_BYTES: usize = 4 << 20;
 const MAX_PIXELS: u64 = 4 << 20;
 
+/// A photo or scan of a signature ([`SignatureImage::from_picture`]) is read within wider limits
+/// and then shrunk: phone cameras take 12 to 50 megapixels.
+pub const MAX_PICTURE_BYTES: usize = 32 << 20;
+const MAX_PICTURE_SIDE: u32 = 8192;
+const MAX_PICTURE_PIXELS: u64 = 52 << 20;
+/// The longest side kept from a picture: over 900 pixels per inch across the 150 pt signature box.
+const PICTURE_SIDE: u32 = 2000;
+
+/// What a source image may ask of the decoder.
+struct Bounds {
+    bytes: usize,
+    side: u32,
+    pixels: u64,
+    alloc: u64,
+    too_big: fn() -> SignatureImageError,
+}
+
+const STORED: Bounds =
+    Bounds { bytes: MAX_SIGNATURE_IMAGE_BYTES, side: 4096, pixels: MAX_PIXELS, alloc: 32 << 20, too_big: || SignatureImageError::Size };
+/// 52 megapixels decode to 156 MiB of RGB (JPEG) or 208 MiB of RGBA (PNG).
+const PICTURE: Bounds = Bounds {
+    bytes: MAX_PICTURE_BYTES,
+    side: MAX_PICTURE_SIDE,
+    pixels: MAX_PICTURE_PIXELS,
+    alloc: 256 << 20,
+    too_big: || SignatureImageError::PictureSize,
+};
+
+/// Decode a PNG or JPEG within `bounds`, upright (EXIF orientation applied).
+fn decode(bytes: &[u8], bounds: &Bounds) -> Result<DynamicImage, SignatureImageError> {
+    if bytes.len() > bounds.bytes {
+        return Err((bounds.too_big)());
+    }
+    let format = image::guess_format(bytes).map_err(|_| SignatureImageError::Format)?;
+    if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
+        return Err(SignatureImageError::Format);
+    }
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(bounds.side);
+    limits.max_image_height = Some(bounds.side);
+    limits.max_alloc = Some(bounds.alloc);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(|e| sized(e, bounds))?;
+    let (w, h) = decoder.dimensions();
+    if w == 0 || h == 0 || w > bounds.side || h > bounds.side || u64::from(w) * u64::from(h) > bounds.pixels {
+        return Err((bounds.too_big)());
+    }
+    let orientation = decoder.orientation()?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|e| sized(e, bounds))?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
+/// A decoder that stopped at one of `bounds`' limits says the picture is too big, in the words
+/// of the limit; anything else is a decoding failure.
+fn sized(error: image::ImageError, bounds: &Bounds) -> SignatureImageError {
+    match error {
+        image::ImageError::Limits(_) => (bounds.too_big)(),
+        other => SignatureImageError::Decode(other),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SignatureImageError {
     #[error("Choose a PNG or JPEG image.")]
     Format,
     #[error("Choose an image smaller than 4 MiB and 4 megapixels (at most 4096 pixels per side).")]
     Size,
+    #[error("Choose a picture smaller than 32 MiB and 50 megapixels (at most 8192 pixels per side).")]
+    PictureSize,
     #[error("Couldn't read the signature image: {0}")]
     Read(#[from] std::io::Error),
     #[error("Couldn't decode the signature image: {0}")]
@@ -120,28 +185,7 @@ impl SignatureImage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, SignatureImageError> {
-        if bytes.len() > MAX_SIGNATURE_IMAGE_BYTES {
-            return Err(SignatureImageError::Size);
-        }
-        let format = image::guess_format(bytes).map_err(|_| SignatureImageError::Format)?;
-        if !matches!(format, ImageFormat::Png | ImageFormat::Jpeg) {
-            return Err(SignatureImageError::Format);
-        }
-        let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
-        let mut limits = Limits::default();
-        limits.max_image_width = Some(4096);
-        limits.max_image_height = Some(4096);
-        limits.max_alloc = Some(32 << 20);
-        reader.limits(limits);
-        let mut decoder = reader.into_decoder()?;
-        let (w, h) = decoder.dimensions();
-        if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_PIXELS {
-            return Err(SignatureImageError::Size);
-        }
-        let orientation = decoder.orientation()?;
-        let mut image = DynamicImage::from_decoder(decoder)?;
-        image.apply_orientation(orientation);
-        let rgba = image.into_rgba8();
+        let rgba = decode(bytes, &STORED)?.into_rgba8();
         let size = [rgba.width() as usize, rgba.height() as usize];
         let mut png = Cursor::new(Vec::new());
         DynamicImage::ImageRgba8(rgba.clone()).write_to(&mut png, ImageFormat::Png)?;
@@ -150,6 +194,38 @@ impl SignatureImage {
             return Err(SignatureImageError::Size);
         }
         Ok(Self { bytes: Arc::new(bytes), rgba: Arc::new(rgba.into_raw()), size })
+    }
+
+    /// [`Self::from_picture`] for a file, reading at most the picture limit plus one byte.
+    pub fn read_picture(reader: impl Read) -> Result<Self, SignatureImageError> {
+        let mut bytes = Vec::new();
+        reader.take(MAX_PICTURE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        Self::from_picture(&bytes)
+    }
+
+    /// A photo or scan of a signature made ready to place: a large picture is shrunk, the paper
+    /// behind the ink becomes transparent whatever its shade and however unevenly it is lit,
+    /// marks away from the signature (the edge of the sheet, a desk) are dropped, and the result
+    /// is cropped to the signature. A picture that already has a transparent background keeps
+    /// it and is only cropped.
+    pub fn from_picture(bytes: &[u8]) -> Result<Self, SignatureImageError> {
+        let image = decode(bytes, &PICTURE)?;
+        let image = if image.width().max(image.height()) > PICTURE_SIDE { image.thumbnail(PICTURE_SIDE, PICTURE_SIDE) } else { image };
+        let mut rgba = crate::signature_paper::prepare(image.into_rgba8());
+        // Mostly transparent pictures compress far below the stored limit; one that doesn't is
+        // shrunk until it fits.
+        for _ in 0..6 {
+            let mut png = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(rgba.clone()).write_to(&mut png, ImageFormat::Png)?;
+            let bytes = png.into_inner();
+            if bytes.len() <= MAX_SIGNATURE_IMAGE_BYTES {
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                return Ok(Self { bytes: Arc::new(bytes), rgba: Arc::new(rgba.into_raw()), size });
+            }
+            let (w, h) = ((rgba.width() * 7 / 10).max(1), (rgba.height() * 7 / 10).max(1));
+            rgba = image::imageops::thumbnail(&rgba, w, h);
+        }
+        Err(SignatureImageError::PictureSize)
     }
 
     pub fn bytes(&self) -> &Arc<Vec<u8>> {
@@ -340,6 +416,182 @@ mod tests {
             let rect = image.rect(&page(rotation), at, false).unwrap();
             assert!(rect.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.01), "{rotation}: {rect:?}, want {want:?}");
         }
+    }
+
+    /// A synthetic photo: paper lit from `lit` (top-left) to `dark` (bottom-right) with a little
+    /// deterministic noise, and a pen stroke `ink` thick across the middle third.
+    fn photo(w: u32, h: u32, lit: f32, dark: f32, ink: [u8; 3]) -> image::RgbImage {
+        let mut seed = 0x2545_f491u32;
+        image::RgbImage::from_fn(w, h, |x, y| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (seed % 9) as f32 - 4.0;
+            let t = (x as f32 / w as f32 + y as f32 / h as f32) / 2.0;
+            let level = lit + (dark - lit) * t;
+            let on_stroke = x > w / 3 && x < w * 2 / 3 && y.abs_diff(h / 2) < (h / 60).max(2);
+            let px = |c: u8| ((if on_stroke { f32::from(c) * level / 255.0 } else { level }) + noise).clamp(0.0, 255.0) as u8;
+            image::Rgb([px(ink[0]), px(ink[1]), px(ink[2])])
+        })
+    }
+
+    fn encoded(image: impl Into<DynamicImage>, format: ImageFormat) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        image.into().write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_photo_on_grey_unevenly_lit_paper_becomes_ink_on_a_clear_background() {
+        // Paper from 205 down to 140: none of it is "near white", and a fixed cutoff keeps it all.
+        let source = encoded(photo(900, 600, 205.0, 140.0, [28, 36, 110]), ImageFormat::Jpeg);
+        let kept = SignatureImage::from_bytes(&source).unwrap().remove_white_background(245, 35).unwrap();
+        assert!(kept.rgba().as_chunks::<4>().0.iter().all(|p| p[3] == 255), "the fixed cutoff leaves a grey box");
+
+        let image = SignatureImage::from_picture(&source).unwrap();
+        let [w, h] = image.size();
+        // Cropped to the stroke (300 x 19 in the photo) and its margin.
+        assert!((300..=360).contains(&w) && (15..=80).contains(&h), "{w} x {h}");
+        let pixels = image.rgba().as_chunks::<4>().0;
+        let at = |x: usize, y: usize| pixels[y * w + x];
+        assert_eq!(at(1, 1)[3], 0, "paper is clear");
+        assert_eq!(at(w - 2, h - 2)[3], 0, "and so is the darker paper at the other end");
+        let ink = at(w / 2, h / 2);
+        assert_eq!(ink[3], 255, "ink is solid");
+        assert!(ink[2] > ink[0] + 40, "and keeps its colour: {ink:?}");
+        let clear = pixels.iter().filter(|p| p[3] == 0).count();
+        let solid = pixels.iter().filter(|p| p[3] == 255).count();
+        assert!(clear + solid > pixels.len() * 97 / 100, "no haze of half-clear paper: {clear} clear, {solid} solid of {}", pixels.len());
+        assert!(pixels.iter().filter(|p| p[3] == 0).all(|p| p[..3] == [255, 255, 255]), "clear pixels hold no paper colour");
+    }
+
+    #[test]
+    fn a_shadow_and_the_desk_around_the_sheet_are_not_taken_for_ink() {
+        // The sheet ends at x = 660 with a dark desk beyond it; the left 300 columns are under a
+        // shadow that halves the light, its edge crossing the stroke (x 240..480, y 290..310).
+        let mut seed = 0x9e37_79b9u32;
+        let photo = image::RgbImage::from_fn(800, 600, |x, y| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (seed % 7) as f32 - 3.0;
+            let level = if x >= 660 {
+                45.0
+            } else if x < 300 {
+                105.0
+            } else {
+                210.0
+            };
+            let on_stroke = (240..480).contains(&x) && (290..310).contains(&y);
+            let v = (if on_stroke { level * 0.12 } else { level } + noise).clamp(0.0, 255.0) as u8;
+            image::Rgb([v, v, v])
+        });
+        let image = SignatureImage::from_picture(&encoded(photo, ImageFormat::Png)).unwrap();
+        let [w, h] = image.size();
+        // Cropped to the stroke and its 18-pixel margin: the desk and the sheet's edge are gone.
+        assert!((240..=290).contains(&w) && (20..=70).contains(&h), "{w} x {h}");
+        let pixels = image.rgba().as_chunks::<4>().0;
+        let row = |y: usize| &pixels[y * w..(y + 1) * w];
+        assert!(row(h / 2)[20..w - 20].iter().all(|p| p[3] == 255), "the stroke is solid on both sides of the shadow's edge");
+        assert!(row(h / 2)[20..w - 20].iter().all(|p| p[0] < 80), "and dark on both sides: lit as on white paper");
+        assert!(row(2).iter().chain(row(h - 3)).all(|p| p[3] == 0), "paper above and below it is clear, in the shadow and out of it");
+    }
+
+    #[test]
+    fn a_phone_sized_photo_is_accepted_and_shrunk() {
+        // 12 megapixels: three times the stored limit.
+        let source = encoded(photo(4000, 3000, 200.0, 170.0, [20, 20, 24]), ImageFormat::Jpeg);
+        assert!(matches!(SignatureImage::from_bytes(&source), Err(SignatureImageError::Size)));
+        let image = SignatureImage::from_picture(&source).unwrap();
+        let [w, h] = image.size();
+        // The stroke is a third of the 2000 pixels the photo is shrunk to.
+        assert!((640..=760).contains(&w) && h < 200, "{w} x {h}");
+        assert!(image.bytes().len() < 200_000, "{} bytes", image.bytes().len());
+        assert_eq!(SignatureImage::from_bytes(image.bytes()).unwrap(), image, "what is stored reads back");
+    }
+
+    #[test]
+    fn a_clean_scan_is_cleared_as_the_fixed_cutoff_clears_it() {
+        let mut scan = image::RgbaImage::from_pixel(240, 80, image::Rgba([255, 255, 255, 255]));
+        for x in 60..180 {
+            for y in 36..44 {
+                scan.put_pixel(x, y, image::Rgba([20, 20, 20, 255]));
+            }
+            // A soft edge: light grey, part ink.
+            scan.put_pixel(x, 35, image::Rgba([227, 227, 227, 255]));
+        }
+        let source = encoded(scan, ImageFormat::Png);
+        let fixed = SignatureImage::from_bytes(&source).unwrap().remove_white_background(245, 35).unwrap();
+        let image = SignatureImage::from_picture(&source).unwrap();
+        let [w, h] = image.size();
+        assert!(w < 140 && h < 30, "cropped to the stroke: {w} x {h}");
+        let pixels = image.rgba().as_chunks::<4>().0;
+        let (left, top) = ((240 - w) / 2, 35 - (h - 9) / 2);
+        for (i, p) in pixels.iter().enumerate() {
+            let (x, y) = (i % w + left, i / w + top);
+            let want = fixed.rgba().as_chunks::<4>().0[y * 240 + x];
+            assert_eq!(p[3], want[3], "alpha at {x},{y}");
+            if p[3] > 0 {
+                assert_eq!(p[..3], want[..3], "ink is unchanged at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_prepared_cut_out_keeps_its_ink_and_is_only_cropped() {
+        let mut cut = image::RgbaImage::from_pixel(200, 100, image::Rgba([0, 0, 0, 0]));
+        for x in 50..150 {
+            for y in 40..60 {
+                // Pale ink that a paper estimate would take for the background.
+                cut.put_pixel(x, y, image::Rgba([180, 190, 230, 200]));
+            }
+        }
+        let image = SignatureImage::from_picture(&encoded(cut, ImageFormat::Png)).unwrap();
+        let [w, h] = image.size();
+        assert!((100..=112).contains(&w) && (20..=32).contains(&h), "{w} x {h}");
+        assert_eq!(image.rgba().as_chunks::<4>().0[(h / 2) * w + w / 2], [180, 190, 230, 200]);
+    }
+
+    #[test]
+    fn pictures_that_are_not_ink_on_paper_are_not_hollowed_out() {
+        // A dark picture has no paper to remove; a blank sheet has no ink to crop to.
+        let dark = SignatureImage::from_picture(&encoded(image::RgbImage::from_pixel(120, 60, image::Rgb([30, 40, 50])), ImageFormat::Png)).unwrap();
+        assert_eq!(dark.size(), [120, 60]);
+        assert!(dark.rgba().as_chunks::<4>().0.iter().all(|p| *p == [30, 40, 50, 255]));
+        let blank =
+            SignatureImage::from_picture(&encoded(image::RgbImage::from_pixel(120, 60, image::Rgb([200, 198, 190])), ImageFormat::Png)).unwrap();
+        assert_eq!(blank.size(), [120, 60]);
+        assert!(blank.rgba().as_chunks::<4>().0.iter().all(|p| p[3] == 0));
+        // A marker stroke thicker than the grid the paper level is measured on stays solid inside.
+        let mut marker = image::RgbImage::from_pixel(400, 300, image::Rgb([190, 190, 185]));
+        for x in 60..340 {
+            for y in 90..210 {
+                marker.put_pixel(x, y, image::Rgb([25, 25, 30]));
+            }
+        }
+        let marker = SignatureImage::from_picture(&encoded(marker, ImageFormat::Png)).unwrap();
+        let [w, h] = marker.size();
+        assert_eq!(marker.rgba().as_chunks::<4>().0[(h / 2) * w + w / 2][3], 255);
+    }
+
+    #[test]
+    fn oversized_and_invalid_pictures_are_rejected() {
+        assert!(matches!(SignatureImage::from_picture(b"GIF89a\x02\0\x02\0"), Err(SignatureImageError::Format)));
+        assert!(SignatureImage::from_picture(b"\x89PNG\r\n\x1a\ntruncated").is_err());
+        assert!(matches!(SignatureImage::from_picture(&vec![0; MAX_PICTURE_BYTES + 1]), Err(SignatureImageError::PictureSize)));
+        assert!(matches!(SignatureImage::from_picture(&png(8193, 1)), Err(SignatureImageError::PictureSize)));
+        assert!(SignatureImage::read_picture(std::io::repeat(0)).is_err());
+        // A PNG header claiming 8192 x 8192 (67 megapixels) is refused before any pixel is read.
+        let mut huge = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        huge.extend_from_slice(&[0, 0, 0x20, 0, 0, 0, 0x20, 0, 8, 2, 0, 0, 0]);
+        huge.extend_from_slice(&[0xfd, 0xc8, 0x5d, 0x0e]);
+        // The start of its image data, which is as far as the header is read.
+        huge.extend_from_slice(&[0, 0, 0, 2, 73, 68, 65, 84, 120, 156, 98, 164, 145, 43]);
+        assert!(
+            matches!(SignatureImage::from_picture(&huge), Err(SignatureImageError::PictureSize)),
+            "{:?}",
+            SignatureImage::from_picture(&huge).err()
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod links;
 pub mod ocr;
 pub mod optimizer;
 pub mod signature_image;
+mod signature_paper;
 mod upright_image;
 pub mod xfa;
 
@@ -47,6 +48,9 @@ pub use pdfcraft_forms::{
 
 pub use pdfcraft_a11y as a11y;
 pub use pdfcraft_edit::{BlockStyle, PageImage, TextBlock, TextLine, first_undrawable};
+// Edited text may take its stand-in font from the fonts installed on this computer; off until an
+// application turns it on (pdfcraft-edit's `sysfont`).
+pub use pdfcraft_edit::{system_fonts_enabled, use_system_fonts};
 pub use pdfcraft_measure as measure;
 pub use pdfcraft_xfa::Report as XfaLayout;
 

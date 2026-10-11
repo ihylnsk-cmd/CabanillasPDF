@@ -1,0 +1,21 @@
+[package]
+name = "pdfcraft-winspool"
+description = "Safe wrapper over the Win32 calls that print bitmaps: list printers, open a job, send pages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Not `[lints] workspace = true`: the workspace forbids unsafe code, and calling Win32 needs it.
+# This crate is the one place that does, behind a safe API (src/win.rs); every unsafe block
+# says why it is sound, and the rest of the workspace's lints still apply.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the lockfile through the window toolkit; only the printing and GDI calls are used.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Printing", "Win32_Storage_Xps"] }

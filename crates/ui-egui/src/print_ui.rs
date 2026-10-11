@@ -211,21 +211,75 @@ impl PdfCraftApp {
             }
         };
         match self.print_draft.printer.clone() {
-            Some(printer) => match spool::submit(&bytes, &self.print_draft.job(&name)) {
-                Ok(msg) => {
-                    self.notify(if msg.is_empty() {
-                        crate::i18n::fmt(tl!("Sent to {printer}"), &[("printer", &printer)])
-                    } else {
-                        crate::i18n::fmt(tl!("Sent to {printer}: {msg}"), &[("printer", &printer), ("msg", &msg)])
-                    });
-                    true
-                }
-                Err(e) => {
-                    self.notify_error(e);
-                    false
-                }
-            },
+            Some(printer) => {
+                let job = self.print_draft.job(&name);
+                self.send_to_printer(printer, bytes, job)
+            }
             None => self.save_print_pdf(&name, bytes),
+        }
+    }
+
+    /// Hand a job to the spooler. On the desktop this runs on its own thread, so the window stays
+    /// usable while the sheets are drawn for the printer (Windows) or a large file is piped to it
+    /// (CUPS); the outcome is reported when it is known ([`Self::poll_print_jobs`]).
+    fn send_to_printer(&mut self, printer: String, bytes: Vec<u8>, job: spool::Job) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = self.ctx.clone();
+            std::thread::spawn(move || {
+                // The receiver may be gone (the app quit): nothing to report to then.
+                let _ = tx.send(spool::submit(&bytes, &job).map_err(|e| e.to_string()));
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
+            self.notify(crate::i18n::fmt("Printing to {printer}…", &[("printer", &printer)]));
+            self.print_jobs.push((printer, rx));
+            true
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let result = spool::submit(&bytes, &job).map_err(|e| e.to_string());
+            self.report_print_job(&printer, result)
+        }
+    }
+
+    /// Say how a job sent to `printer` ended. Returns whether it reached the spooler.
+    fn report_print_job(&mut self, printer: &str, result: Result<String, String>) -> bool {
+        match result {
+            Ok(msg) => {
+                self.notify(if msg.is_empty() {
+                    crate::i18n::fmt(tl!("Sent to {printer}"), &[("printer", printer)])
+                } else {
+                    crate::i18n::fmt(tl!("Sent to {printer}: {msg}"), &[("printer", printer), ("msg", &msg)])
+                });
+                true
+            }
+            Err(e) => {
+                self.notify_error(e);
+                false
+            }
+        }
+    }
+
+    /// Pick up finished print jobs (each frame).
+    pub(crate) fn poll_print_jobs(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut finished = Vec::new();
+            self.print_jobs.retain(|(printer, rx)| {
+                let result = match rx.try_recv() {
+                    Ok(result) => result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("printing stopped unexpectedly".to_string()),
+                };
+                finished.push((printer.clone(), result));
+                false
+            });
+            for (printer, result) in finished {
+                self.report_print_job(&printer, result);
+            }
         }
     }
 

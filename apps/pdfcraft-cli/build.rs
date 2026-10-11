@@ -15,6 +15,8 @@ fn main() {
     let mut res = winresource::WindowsResource::new();
     res.set("ProductName", "PdfCraft")
         .set("FileDescription", "PdfCraft command-line tool")
+        // Shown under Properties ▸ Details: this is a fork, and says so.
+        .set("Comments", "Modified build, not an official PdfCraft release. Based on PdfCraft, https://github.com/storytold/pdfcraft")
         .set("LegalCopyright", "Copyright (c) the PdfCraft contributors. MIT OR Apache-2.0.")
         .set("OriginalFilename", "pdfcraft-cli.exe")
         .set("InternalName", "pdfcraft-cli");

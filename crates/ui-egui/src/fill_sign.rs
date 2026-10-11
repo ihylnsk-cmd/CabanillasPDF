@@ -513,7 +513,13 @@ pub(crate) fn signature_pad(
     });
     ui.add_space(6.0);
     if d.image_mode {
-        ui.label(egui::RichText::new(tl!("Choose a PNG or JPEG image (up to 4 MiB). Transparency is preserved.")).color(t.text_muted));
+        // Added in this modified build, so in English only: not in the translation catalogues.
+        ui.label(
+            egui::RichText::new(
+                "Choose a PNG or JPEG picture of the signature: a scan, a phone photo or a cut-out. The paper behind the ink is removed.",
+            )
+            .color(t.text_muted),
+        );
         let browse = crate::widgets::ghost_button(ui, "folder", tl!("Browse…")).clicked();
         let (rect, _) = ui.allocate_exact_size(vec2(460.0, 150.0), Sense::hover());
         ui.painter().rect_filled(rect, CornerRadius::same(6), Color32::WHITE);
@@ -648,9 +654,10 @@ impl crate::PdfCraftApp {
             if app.dialog_epoch() != epoch || app.dialog != Some(crate::Dialog::Signature) || app.signature_draft.initials != initials {
                 return;
             }
-            let result =
-                std::fs::File::open(path).map_err(pdfcraft_engine::signature_image::SignatureImageError::from).and_then(SignatureImage::read);
-            app.use_signature_image(result.map_err(|e| e.to_string()));
+            let result = std::fs::File::open(path).map_err(|e| e.to_string()).and_then(|file| {
+                pdfcraft_engine::guard(|| SignatureImage::read_picture(file)).map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+            });
+            app.use_signature_image(result);
         });
         #[cfg(target_arch = "wasm32")]
         {
@@ -663,16 +670,16 @@ impl crate::PdfCraftApp {
             let ctx = self.ctx.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let bytes = if let Some(file) = dialog.pick_file().await {
-                    if file.inner().size() > pdfcraft_engine::signature_image::MAX_SIGNATURE_IMAGE_BYTES as f64 {
-                        Some(Err(pdfcraft_engine::signature_image::SignatureImageError::Size.to_string()))
+                    if file.inner().size() > pdfcraft_engine::signature_image::MAX_PICTURE_BYTES as f64 {
+                        Some(Err(pdfcraft_engine::signature_image::SignatureImageError::PictureSize.to_string()))
                     } else {
                         // `pick_file` returns a readable handle. Read its Blob directly so a
                         // rejected browser read is an error (rfd's read helper unwraps it).
                         Some(match wasm_bindgen_futures::JsFuture::from(file.inner().array_buffer()).await {
                             Ok(buffer) => {
                                 let bytes = js_sys::Uint8Array::new(&buffer);
-                                if bytes.length() as usize > pdfcraft_engine::signature_image::MAX_SIGNATURE_IMAGE_BYTES {
-                                    Err(pdfcraft_engine::signature_image::SignatureImageError::Size.to_string())
+                                if bytes.length() as usize > pdfcraft_engine::signature_image::MAX_PICTURE_BYTES {
+                                    Err(pdfcraft_engine::signature_image::SignatureImageError::PictureSize.to_string())
                                 } else {
                                     Ok(bytes.to_vec())
                                 }
@@ -701,13 +708,13 @@ impl crate::PdfCraftApp {
         }
         let Some(bytes) = picked.bytes else { return };
         let result = bytes
-            .and_then(|bytes| pdfcraft_engine::guard(|| SignatureImage::from_bytes(&bytes)).map_err(|e| e.to_string())?.map_err(|e| e.to_string()));
+            .and_then(|bytes| pdfcraft_engine::guard(|| SignatureImage::from_picture(&bytes)).map_err(|e| e.to_string())?.map_err(|e| e.to_string()));
         self.use_signature_image(result);
     }
 
+    /// Take a picture read with [`SignatureImage::from_picture`]: paper cleared, cropped to the ink.
     fn use_signature_image(&mut self, result: Result<SignatureImage, String>) {
-        let cleaned = result.and_then(|image| image.remove_white_background(245, 35).map_err(|e| e.to_string()));
-        match cleaned {
+        match result {
             Ok(image) => {
                 self.signature_draft.image = Some(image);
                 self.toast = None;

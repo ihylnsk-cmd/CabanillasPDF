@@ -462,7 +462,13 @@ impl Automation {
             }
             let path = self.resolve(path, false)?;
             let file = std::fs::File::open(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
-            let image = pdfcraft_engine::SignatureImage::read(file).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+            // `clean`: a photo or scan, as the app's Image tab takes it. Otherwise the image as it is.
+            let image = if a.opt_bool("clean")?.unwrap_or(false) {
+                pdfcraft_engine::guard(|| pdfcraft_engine::SignatureImage::read_picture(file)).map_err(failed)?
+            } else {
+                pdfcraft_engine::SignatureImage::read(file)
+            }
+            .map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
             let edit = image.edit(page, &info, at, kind == "initials", &author).ok_or_else(|| ToolError::InvalidArgs("at must be finite".into()))?;
             return self.apply(a, edit);
         }

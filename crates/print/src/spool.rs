@@ -1,9 +1,15 @@
 //! The system print spooler. On macOS and Linux this is CUPS: printers come from `lpstat` — its
 //! queues, and the driverless destinations it can print to without one — and jobs are piped to
-//! `lp` with the job options (copies, collation, duplex, colour). Other platforms report that
-//! printing isn't available yet; the print-ready PDF can still be saved.
+//! `lp` with the job options (copies, collation, duplex, colour). On Windows it is the Windows
+//! spooler: printers come from the system's list, and each sheet is drawn and sent as a bitmap
+//! (`win_spool`). The web build reports that printing isn't available; the print-ready PDF can
+//! still be saved.
 
 use crate::PrintError;
+
+#[cfg(windows)]
+#[path = "win_spool.rs"]
+mod win_spool;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Printer {
@@ -309,7 +315,11 @@ pub fn printers() -> Vec<Printer> {
         let available = lpstat_e_command().output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         printers_parsed(&queues, available.as_deref())
     }
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(windows)]
+    {
+        win_spool::printers()
+    }
+    #[cfg(not(any(windows, all(unix, not(target_arch = "wasm32")))))]
     {
         Vec::new()
     }
@@ -333,13 +343,41 @@ pub fn printers_parsed(queues: &str, available: Option<&str>) -> Vec<Printer> {
     printers
 }
 
+/// The sheets to send when the printer can't make the copies itself (`passes` > 1): each sheet's
+/// index in order, `None` for a blank side. Collated, the document is sent `passes` times;
+/// uncollated, each sheet `passes` times. Two-sided copies are always sent whole, with a blank
+/// side after an odd number of sheets so no copy starts on the back of the one before.
+/// (Windows; CUPS makes the copies itself.)
+#[cfg(any(test, windows))]
+pub(crate) fn send_order(sheets: usize, passes: u32, collate: bool, two_sided: bool) -> Vec<Option<usize>> {
+    let passes = passes.clamp(1, 999) as usize;
+    if passes == 1 {
+        return (0..sheets).map(Some).collect();
+    }
+    if !collate && !two_sided {
+        return (0..sheets).flat_map(|i| std::iter::repeat_n(Some(i), passes)).collect();
+    }
+    let mut order = Vec::with_capacity(passes.saturating_mul(sheets.saturating_add(1)));
+    for pass in 0..passes {
+        order.extend((0..sheets).map(Some));
+        if two_sided && sheets % 2 == 1 && pass + 1 < passes {
+            order.push(None);
+        }
+    }
+    order
+}
+
 /// Send a print-ready PDF to the spooler. Returns the spooler's message (the job id).
 pub fn submit(pdf: &[u8], job: &Job) -> Result<String, PrintError> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     {
         submit_via(std::process::Command::new("lp"), pdf, job)
     }
-    #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+    #[cfg(windows)]
+    {
+        win_spool::submit(pdf, job)
+    }
+    #[cfg(not(any(windows, all(unix, not(target_arch = "wasm32")))))]
     {
         let _ = (pdf, job);
         Err(PrintError::Spool("printing to a printer isn't available on this platform yet; save the print-ready PDF instead".into()))

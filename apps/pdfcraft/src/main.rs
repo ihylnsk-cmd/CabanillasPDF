@@ -32,6 +32,7 @@ use pdfcraft_ui_egui::PdfCraftApp;
 mod apple_events;
 mod logging;
 mod single_instance;
+#[cfg(feature = "upstream-updates")]
 mod updates;
 #[cfg(test)]
 #[path = "windows_manifest.rs"]
@@ -296,12 +297,17 @@ fn app_creator<'a>(
     let Launch { files, options, control_file, create_images, integrated } = launch;
     Box::new(move |cc| {
         started.set(true);
+        // Edited text keeps its typeface when the family is installed here (pdfcraft-edit's `sysfont`).
+        pdfcraft_ui_egui::use_system_fonts(true);
         let mut app = PdfCraftApp::new();
         if let Some(json) = cc.storage.and_then(|s| s.get_string("pdfcraft").or_else(|| s.get_string(LEGACY_STORAGE_KEY))) {
             app.restore(&json);
         }
         app.integrated_titlebar = integrated;
-        app.update_source = Some(std::sync::Arc::new(updates::latest_release));
+        #[cfg(feature = "upstream-updates")]
+        {
+            app.update_source = Some(std::sync::Arc::new(updates::latest_release));
+        }
         app.os_key_store_ids = cfg!(any(target_os = "macos", target_os = "windows"));
         #[cfg(target_os = "macos")]
         {

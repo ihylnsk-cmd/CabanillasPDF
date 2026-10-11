@@ -397,7 +397,8 @@ fn image_signatures_and_initials_can_be_imported_placed_and_remembered() {
     let doc = state.session.get(state.views[0].id).unwrap();
     for a in &doc.info.annotations {
         assert_eq!(a.subtype, "Stamp");
-        assert!(((a.rect[2] - a.rect[0]) / (a.rect[3] - a.rect[1]) - 3.0).abs() < 0.001);
+        // The 120 x 40 picture is cropped to its ink (100 x 20) and a 4-pixel margin.
+        assert!(((a.rect[2] - a.rect[0]) / (a.rect[3] - a.rect[1]) - 108.0 / 28.0).abs() < 0.001, "{:?}", a.rect);
         assert!(a.rect[2] - a.rect[0] <= 150.0);
     }
     assert_eq!(doc.can_undo(), Some("Add initials"));

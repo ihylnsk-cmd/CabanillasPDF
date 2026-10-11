@@ -11,8 +11,10 @@ workspace = true
 [dependencies]
 # Help ▸ Check for updates (issue #28): one HTTPS request to GitHub, over rustls with the OS's
 # trusted roots. No bundled root list (webpki-roots and webpki-root-certs are CDLA-licensed).
-ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "_ring"] }
-rustls-native-certs = "0.8"
+# Optional (feature `upstream-updates`): a modified build is not an upstream release, so it does
+# not ask upstream for newer versions and contains no network client at all.
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "_ring"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 pdfcraft-ui-egui = { workspace = true }
 # wgpu draws; OpenGL (glow) is the fallback when wgpu can't start on an old or unusual GPU or
 # driver (#461, #435, #392), and can be chosen with PDFCRAFT_RENDERER=gl.
@@ -44,3 +46,8 @@ uds_windows = "=1.2.1"
 [build-dependencies]
 # Icon + VERSIONINFO for pdfcraft.exe; build.rs only uses it when targeting Windows.
 winresource = "0.1"
+
+[features]
+# Help ▸ Check for updates asks GitHub for the latest release of upstream PdfCraft
+# (github.com/storytold/pdfcraft). Off in this fork: its builds come from whoever maintains it.
+upstream-updates = ["dep:ureq", "dep:rustls-native-certs"]

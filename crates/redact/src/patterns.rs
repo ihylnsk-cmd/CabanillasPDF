@@ -68,14 +68,68 @@ fn digit_run(s: &[char], start: usize, seps: &[char], max_len: usize) -> (usize,
     (i, n)
 }
 
+/// A North American number written the usual way, from `pos`: an optional `1`, a three-digit
+/// area code (in parentheses or not), three digits and four digits, with one separator between
+/// the groups ("(555) 123-4567", "555.123.4567", "1 555 123 4567"). Returns where it ends.
+fn nanp_shape_at(s: &[char], pos: usize) -> Option<usize> {
+    let sep = |k: usize| matches!(s.get(k), Some(' ' | '-' | '.'));
+    let digits = |from: usize, n: usize| (from..from.saturating_add(n)).all(|k| digit(s.get(k)));
+    let mut p = pos;
+    if s.get(p) == Some(&'1') && sep(p + 1) && (digit(s.get(p + 2)) || s.get(p + 2) == Some(&'(')) {
+        p += 2;
+    }
+    if s.get(p) == Some(&'(') {
+        if !(digits(p + 1, 3) && s.get(p + 4) == Some(&')')) {
+            return None;
+        }
+        p += 5;
+        if sep(p) {
+            p += 1;
+        }
+    } else {
+        if !(digits(p, 3) && sep(p + 3)) {
+            return None;
+        }
+        p += 4;
+    }
+    if !(digits(p, 3) && sep(p + 3) && digits(p + 4, 4)) || digit(s.get(p + 8)) {
+        return None;
+    }
+    Some(p + 8)
+}
+
+/// Whether `i` is inside a number written with hyphens, full stops or slashes ("219-09-9999" at
+/// "09"): nothing starts there.
+fn mid_number(s: &[char], i: usize) -> bool {
+    i >= 2 && matches!(s.get(i - 1), Some('-' | '.' | '/')) && digit(s.get(i - 2))
+}
+
+/// ddd-dd-dddd: the shape of a US Social Security number, whatever its digits.
+fn ssn_shaped(s: &[char], i: usize) -> bool {
+    let g = |from: usize, n: usize| (from..from + n).all(|k| digit(s.get(k)));
+    g(i, 3) && s.get(i + 3) == Some(&'-') && g(i + 4, 2) && s.get(i + 6) == Some(&'-') && g(i + 7, 4) && !digit(s.get(i + 11))
+}
+
 fn phone(s: &[char], i: usize) -> Option<usize> {
     let start_ok = s[i] == '+' && digit(s.get(i + 1)) || s[i] == '(' && digit(s.get(i + 1)) || s[i].is_ascii_digit();
-    if !start_ok || word(i.checked_sub(1).and_then(|p| s.get(p))) || s.get(i.wrapping_sub(1)) == Some(&'+') {
+    if !start_ok || word(i.checked_sub(1).and_then(|p| s.get(p))) || s.get(i.wrapping_sub(1)) == Some(&'+') || mid_number(s, i) {
         return None;
     }
     let plus = s[i] == '+';
     let first = if plus { i + 1 } else { i };
     let (end, n) = digit_run(s, first, &[' ', '-', '.', '(', ')'], 28);
+    // The page text separates words, table cells and lines by one space, exactly like the groups
+    // of one number, so the digits that follow a number run into it: the next cell's number, the
+    // next line, "… 24 hours a day". A North American number ends where its shape ends
+    // ("555-123-4567 24", "(555) 123-4567 078-05-1120", "555 123 4567 555 987 6543"); taking
+    // the run whole would leave it unmarked, or mark its tail and leave the area code showing.
+    if !plus
+        && let Some(cut) = nanp_shape_at(s, i)
+        && cut < end
+        && s.get(cut) == Some(&' ')
+    {
+        return Some(cut - i);
+    }
     let run = s.get(first..end)?;
     let seps = run.iter().filter(|c| !c.is_ascii_digit()).count();
     // Always grouped by at least one separator, so plain numbers never match.
@@ -90,11 +144,12 @@ fn phone(s: &[char], i: usize) -> Option<usize> {
         let nanp = (10..=11).contains(&n);
         // National with a trunk 0 and 6–14 more digits ("0211 123456", "01 23 45 67 89").
         // The first group needs two digits so decimals ("0.1234567") don't match, and
-        // day-first dates ("01.10.2026") are left to the date pattern.
+        // day-first dates ("01.10.2026") are left to the date pattern. A number shaped like a
+        // Social Security number ("078-05-1120") is left to that pattern.
         let mut digits = run.iter().skip_while(|c| !c.is_ascii_digit());
         let trunk_zero = digits.clone().next() == Some(&'0');
         let lead = digits.by_ref().take_while(|c| c.is_ascii_digit()).count();
-        let trunk = trunk_zero && (7..=15).contains(&n) && lead >= 2 && date(s, i).is_none();
+        let trunk = trunk_zero && (7..=15).contains(&n) && lead >= 2 && date(s, i).is_none() && !ssn_shaped(s, i);
         nanp || trunk
     };
     ok.then_some(end - i)
@@ -144,11 +199,16 @@ fn credit_card(s: &[char], i: usize) -> Option<usize> {
         return None;
     }
     let (end, n) = digit_run(s, i, &[' ', '-'], 23);
-    if !(13..=19).contains(&n) || digit(s.get(end)) {
-        return None;
+    let valid = |to: usize| {
+        let digits: Vec<u32> = s.get(i..to).unwrap_or_default().iter().filter_map(|c| c.to_digit(10)).collect();
+        (13..=19).contains(&digits.len()) && luhn(&digits)
+    };
+    if (13..=19).contains(&n) && !digit(s.get(end)) && valid(end) {
+        return Some(end - i);
     }
-    let digits: Vec<u32> = s[i..end].iter().filter_map(|c| c.to_digit(10)).collect();
-    luhn(&digits).then_some(end - i)
+    // More digits follow the number after a space (the next table cell or line, or the run was
+    // cut inside the next number): the longest leading groups that make a valid card number.
+    (i + 1..end).rev().find(|&cut| digit(s.get(cut - 1)) && s.get(cut) == Some(&' ') && valid(cut)).map(|cut| cut - i)
 }
 
 fn ssn(s: &[char], i: usize) -> Option<usize> {
@@ -316,6 +376,27 @@ mod tests {
     }
 
     #[test]
+    fn phone_numbers_next_to_other_numbers() {
+        // A table column read top to bottom: every number, not just the last.
+        assert_eq!(
+            found(Pattern::Phone, "Phone (212) 555-0147 (646) 555-0199 (718) 555-0123"),
+            ["(212) 555-0147", "(646) 555-0199", "(718) 555-0123"]
+        );
+        assert_eq!(found(Pattern::Phone, "212-555-0147 646-555-0199 718.555.0123"), ["212-555-0147", "646-555-0199", "718.555.0123"]);
+        assert_eq!(found(Pattern::Phone, "212 555 0147 646 555 0199"), ["212 555 0147", "646 555 0199"]);
+        // A row with other numbers beside it, in either order.
+        assert_eq!(found(Pattern::Phone, "Jordan Avery 078-05-1120 (212) 555-0147 Morgan Blake"), ["(212) 555-0147"]);
+        assert_eq!(found(Pattern::Phone, "Jordan Avery (212) 555-0147 078-05-1120"), ["(212) 555-0147"]);
+        // Running text: the number ends before the next figure.
+        assert_eq!(found(Pattern::Phone, "Call 212-555-0147 24 hours a day, or 1-800-555-0100 7 days a week"), ["212-555-0147", "1-800-555-0100"]);
+        // Nothing starts inside a hyphenated number, and a column of Social Security numbers is not a phone list.
+        assert_eq!(found(Pattern::Phone, "SSN 078-05-1120 219-09-9999 457-55-5462 end"), Vec::<String>::new());
+        assert_eq!(found(Pattern::Phone, "Social Security number 078-05-1120, reachable"), Vec::<String>::new());
+        // The whole number, never its tail with the area code left showing.
+        assert_eq!(found(Pattern::Phone, "tel 212 555 0147 99 88"), ["212 555 0147"]);
+    }
+
+    #[test]
     fn emails() {
         assert_eq!(
             found(Pattern::Email, "Write to ada.lovelace+pdf@example.co.uk, or bob@host (no TLD) or x@y.z."),
@@ -328,6 +409,11 @@ mod tests {
         assert_eq!(
             found(Pattern::CreditCard, "Visa 4111 1111 1111 1111, bad 4111 1111 1111 1112, amex 3782-822463-10005"),
             ["4111 1111 1111 1111", "3782-822463-10005"]
+        );
+        // Neighbouring cells and trailing figures don't hide a card number.
+        assert_eq!(
+            found(Pattern::CreditCard, "Cards 4111 1111 1111 1111 5500 0000 0000 0004 and 4111-1111-1111-1111 12 more"),
+            ["4111 1111 1111 1111", "5500 0000 0000 0004", "4111-1111-1111-1111"]
         );
     }
 

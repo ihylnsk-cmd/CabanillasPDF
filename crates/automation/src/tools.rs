@@ -933,7 +933,7 @@ pub fn tools() -> Vec<ToolDef> {
         t(
             "fill_sign_add",
             "Fill & Sign: type text or place a mark",
-            "Fill in a form that has no fields, as Acrobat's Fill & Sign does: type text (`text`, 10 pt), place a check, cross, dot or line, today's date (in Preferences ▸ Date format, see fill_sign_date_format, or `format`), or a signature or initials (either `text` drawn in a script font, or `path` to a local PNG/JPEG image up to 4 MiB and 4 megapixels, preserving transparency). `at` [x, y] is in points from the top-left of the page: text's top-left, mark's centre, signature's left edge centred vertically. Image signatures fit within 150 pt wide and 32 pt tall (24 pt for initials). Creates movable, undoable annotations.",
+            "Fill in a form that has no fields, as Acrobat's Fill & Sign does: type text (`text`, 10 pt), place a check, cross, dot or line, today's date (in Preferences ▸ Date format, see fill_sign_date_format, or `format`), or a signature or initials (either `text` drawn in a script font, or `path` to a local PNG/JPEG image up to 4 MiB and 4 megapixels, preserving transparency; with `clean` a photo or scan up to 32 MiB and 50 megapixels, shrunk, its paper background removed and cropped to the ink, as the app's Image tab does). `at` [x, y] is in points from the top-left of the page: text's top-left, mark's centre, signature's left edge centred vertically. Image signatures fit within 150 pt wide and 32 pt tall (24 pt for initials). Creates movable, undoable annotations.",
         )
         .cmd("sign.fill.text")
         .with(schema(
@@ -944,6 +944,7 @@ pub fn tools() -> Vec<ToolDef> {
                 "at": point(),
                 "text": { "type": "string", "minLength": 1 },
                 "path": { "type": "string", "description": "PNG or JPEG for signature/initials; pass either path or text." },
+                "clean": { "type": "boolean", "description": "With path: treat it as a photo or scan of a signature (remove the paper, crop to the ink). Default false: the image as it is." },
                 "format": { "type": "string", "description": "For type date: this pattern instead of the date-format preference, e.g. \"dd.mm.yyyy\"." },
                 "language": { "type": "string", "description": "For type date: month and weekday names in this language code (see fill_sign_date_format) instead of the preference." },
                 "author": { "type": "string" },

@@ -615,6 +615,8 @@ mod flatten;
 pub use flatten::{flatten, flatten_fill_sign};
 pub mod images;
 pub use images::{ImageChange, PageImage, change_image, page_images, reading_images, rect_to_rect, turn_about_centre};
+mod sysfont;
+pub use sysfont::{system_fonts_enabled, use_system_fonts};
 pub mod text;
 pub use text::{BlockStyle, LineEdit, TextBlock, TextLine, reading_blocks, replace_block, replace_line, rewrite_block, text_blocks, text_lines};
 pub mod added;

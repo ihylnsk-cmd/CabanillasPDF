@@ -1607,3 +1607,267 @@ fn hostile_form_xobjects_are_read_once() {
     assert_eq!(texts, ["once", "from b", "from a", "inherited", "bad matrix"]);
     assert!(images::reading_images(&doc, 0).unwrap().is_empty());
 }
+
+// ---- Stand-in fonts from this computer (src/sysfont.rs) ----
+
+const INTER: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+const JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
+
+/// `text_page` with its subset font (/F2: glyphs for a and b only) named `base`.
+fn subset_font_page(content: &str, base: &str) -> Document {
+    let mut doc = text_page(content);
+    let r = pdfcraft_cos::ObjRef::new(6, 0);
+    let mut font = doc.get(r).as_dict().unwrap().clone();
+    font.set(b"BaseFont".to_vec(), pdfcraft_cos::Object::name(base));
+    doc.set(r, pdfcraft_cos::Object::Dict(font));
+    doc
+}
+
+/// The font dictionary a line is shown in after an edit.
+fn line_font(doc: &Document, line: &text::TextLine) -> pdfcraft_cos::Dict {
+    let p = pdfcraft_model::pages(doc).swap_remove(0);
+    let res = doc.resolve(p.dict.get(b"Resources").unwrap());
+    let fonts = doc.resolve(res.as_dict().unwrap().get(b"Font").unwrap());
+    doc.resolve(fonts.as_dict().unwrap().get(line.font.as_bytes()).unwrap()).as_dict().unwrap().clone()
+}
+
+#[test]
+fn a_line_keeps_its_typeface_when_the_family_is_installed() {
+    let page = || subset_font_page("BT /F2 10 Tf 72 600 Td (ab) Tj 0 -14 Td (ba) Tj ET", "ABCDEF+Inter-Regular");
+    // Without system fonts (the library default) the missing letters come from a standard font.
+    let mut doc = page();
+    assert_eq!(text::replace_line(&mut doc, 0, 0, "abc Zoë").unwrap().substituted.as_deref(), Some("Helvetica"));
+    // With the family installed, the line stays in it: an embedded subset with a Unicode map.
+    let mut doc = page();
+    let after = text::text_lines(&doc, 0).unwrap()[1].rect;
+    let edit = crate::sysfont::native::with_fonts(&[JETBRAINS_MONO, INTER], || text::replace_line(&mut doc, 0, 0, "abc Zoë — 5%"));
+    assert_eq!(edit.unwrap().substituted.as_deref(), Some("Inter"));
+    let doc = reopen(&doc);
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines[0].text, "abc Zoë — 5%");
+    assert!(lines[0].base_font.ends_with("+Inter-Regular"), "{}", lines[0].base_font);
+    assert!((lines[0].size - 10.0).abs() < 1e-9 && (lines[0].rect[0] - 72.0).abs() < 0.01);
+    // The line after it has not moved and is still in the document's own font.
+    assert_eq!((lines[1].text.as_str(), lines[1].rect), ("ba", after));
+    assert_eq!(lines[1].base_font, "ABCDEF+Inter-Regular");
+    let font = line_font(&doc, &lines[0]);
+    assert_eq!((font.name(b"Subtype"), font.name(b"Encoding")), (Some(&b"Type0"[..]), Some(&b"Identity-H"[..])));
+    let descendant = doc.resolve(&doc.resolve(font.get(b"DescendantFonts").unwrap()).as_array().unwrap()[0]);
+    let descriptor = doc.resolve(descendant.as_dict().unwrap().get(b"FontDescriptor").unwrap());
+    let file = doc.resolve(descriptor.as_dict().unwrap().get(b"FontFile2").unwrap());
+    let pdfcraft_cos::Object::Stream(file) = &*file else { panic!("the font program is embedded") };
+    let program = file.decoded().unwrap();
+    assert!(program.len() > 500 && program.len() < INTER.len() / 10, "a small subset, not the whole font: {} bytes", program.len());
+    // The stand-in can be edited again, reusing the embedded subset when it has the letters.
+    let mut doc = doc;
+    assert_eq!(text::replace_line(&mut doc, 0, 0, "Zoë abc").unwrap().substituted, None);
+    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, "Zoë abc");
+}
+
+#[test]
+fn a_different_family_is_not_passed_off_as_the_documents_font() {
+    // Only a monospaced face is installed: it is no match for a subset of Arial, so the edit
+    // falls back to the standard font exactly as it does with system fonts off.
+    let mut doc = text_page("BT /F2 10 Tf 72 600 Td (ab) Tj ET");
+    let edit = crate::sysfont::native::with_fonts(&[JETBRAINS_MONO], || text::replace_line(&mut doc, 0, 0, "abc"));
+    assert_eq!(edit.unwrap().substituted.as_deref(), Some("Helvetica"));
+}
+
+#[test]
+fn characters_no_bundled_font_has_come_from_an_installed_one() {
+    // Cyrillic: outside the standard fonts. Without craft-fonts nothing bundled has it either.
+    let page = || text_page("BT /F1 12 Tf 72 700 Td (Hello) Tj ET");
+    let bundled = text::replace_line(&mut page(), 0, 0, "Привет").is_ok();
+    let mut doc = page();
+    let edit = crate::sysfont::native::with_fonts(&[INTER], || text::replace_line(&mut doc, 0, 0, "Привет"));
+    let used = edit.unwrap().substituted.unwrap();
+    assert!(if bundled { used.ends_with("Type3") } else { used == "Inter" }, "{used}");
+    assert_eq!(text::text_lines(&reopen(&doc), 0).unwrap()[0].text, "Привет");
+    // Still a clear error when no installed font has the characters.
+    let mut doc = page();
+    assert!(crate::sysfont::native::with_fonts(&[INTER], || text::replace_line(&mut doc, 0, 0, "\u{1f4a9}")).is_err());
+}
+
+#[test]
+fn a_paragraph_is_rewrapped_in_its_own_typeface() {
+    let mut doc = subset_font_page(
+        "BT /F2 10 Tf 12 TL 72 700 Td (ab ba ab ba ab ba ab ba ab) Tj T* (ba ab ba ab ba ab ba ab ba) Tj T* (ab ba) Tj ET",
+        "ABCDEF+Inter-Regular",
+    );
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks[0].lines, [0, 1, 2]);
+    let width = blocks[0].rect[2] - blocks[0].rect[0];
+    let long = "The quick brown fox jumps over the lazy dog, then naps: 100% naïve, déjà vu.";
+    let edit = crate::sysfont::native::with_fonts(&[INTER], || text::replace_block(&mut doc, 0, 0, long));
+    assert_eq!(edit.unwrap().substituted.as_deref(), Some("Inter"));
+    let doc = reopen(&doc);
+    let lines = text::text_lines(&doc, 0).unwrap();
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks[0].text, long);
+    assert!(blocks[0].lines.len() >= 2, "wrapped: {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    for i in &blocks[0].lines {
+        let l = &lines[*i];
+        assert!(l.base_font.ends_with("+Inter-Regular") && l.rect[2] - l.rect[0] <= width + 1.0, "{} fits in {width}: {:?}", l.text, l.rect);
+    }
+    // Wrapped with the font's real widths: every line but the last nearly fills the paragraph.
+    let first = &lines[blocks[0].lines[0]];
+    assert!(first.rect[2] - first.rect[0] > width * 0.7, "{:?} in {width}", first.rect);
+}
+
+#[test]
+fn a_short_line_does_not_take_the_first_line_of_the_paragraph_below() {
+    // "named below." ends a paragraph; a blank line's worth of space later the next one starts.
+    let doc = text_page(
+        "BT /F1 11 Tf 90 700 Td (named below.) Tj 0 -24.5 Td (The provider will deliver managed services,) Tj \
+         0 -14.5 Td (and quarterly reviews. Fees are invoiced) Tj 0 -14.5 Td (date. Either party may end this.) Tj ET",
+    );
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks.iter().map(|b| b.lines.clone()).collect::<Vec<_>>(), [vec![0], vec![1, 2, 3]]);
+    // Evenly spaced lines are one paragraph however wide the spacing, and two lines still pair up.
+    let doc =
+        text_page("BT /F1 11 Tf 90 700 Td (one) Tj 0 -24 Td (two) Tj 0 -24 Td (three) Tj ET BT /F1 11 Tf 90 500 Td (four) Tj 0 -24 Td (five) Tj ET");
+    assert_eq!(text::text_blocks(&doc, 0).unwrap().iter().map(|b| b.lines.clone()).collect::<Vec<_>>(), [vec![0, 1, 2], vec![3, 4]]);
+}
+
+fn line_with<'a>(lines: &'a [text::TextLine], text: &str) -> &'a text::TextLine {
+    lines
+        .iter()
+        .find(|l| l.text.trim() == text)
+        .unwrap_or_else(|| panic!("no line {text:?} in {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>()))
+}
+
+#[test]
+fn the_run_after_an_edited_one_on_its_row_moves_with_its_end() {
+    // A name in one font, then the sentence it opens in another, then a second line. "Name" is
+    // 31.5 pt wide in 12 pt Helvetica.
+    for src in [
+        // Each run positioned.
+        "BT /F1 12 Tf 72 700 Td (Name) Tj /F2 12 Tf 31.5 0 Td (abab) Tj /F1 12 Tf -31.5 -20 Td (Second line) Tj ET",
+        // The second run simply carries on from where the first ended.
+        "BT /F1 12 Tf 72 700 Td (Name) Tj /F2 12 Tf (abab) Tj /F1 12 Tf 0 -20 Td (Second line) Tj ET",
+    ] {
+        for by_line in [false, true] {
+            let mut doc = text_page(src);
+            let before = text::text_lines(&doc, 0).unwrap();
+            let (run, second) = (line_with(&before, "abab").rect, line_with(&before, "Second line").rect);
+            assert!((run[0] - line_with(&before, "Name").rect[2]).abs() < 0.01, "the fixture's runs touch");
+            for new in ["Nameless One", "N"] {
+                if by_line {
+                    let at =
+                        text::text_lines(&doc, 0).unwrap().iter().position(|l| l.base_font == "Helvetica" && l.origin_baseline() == 700.0).unwrap();
+                    text::replace_line(&mut doc, 0, at, new).unwrap();
+                } else {
+                    let at = text::text_blocks(&doc, 0).unwrap().iter().position(|b| b.base_font == "Helvetica" && b.rect[3] > 700.0).unwrap();
+                    text::replace_block(&mut doc, 0, at, new).unwrap();
+                }
+                let doc = reopen(&doc);
+                let lines = text::text_lines(&doc, 0).unwrap();
+                let (name, moved) = (line_with(&lines, new), line_with(&lines, "abab"));
+                assert!(
+                    (moved.rect[0] - name.rect[2]).abs() < 0.01,
+                    "{src} {by_line} {new:?}: the run starts at {} where the name ends at {}",
+                    moved.rect[0],
+                    name.rect[2]
+                );
+                assert!((moved.rect[2] - moved.rect[0] - (run[2] - run[0])).abs() < 0.01, "and is as wide as it was");
+                assert_eq!(moved.origin_baseline(), 700.0);
+                let below = line_with(&lines, "Second line").rect;
+                assert!(close(below, second), "{src} {by_line} {new:?}: the line below stays: {below:?}, was {second:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_run_with_others_after_it_does_not_wrap_onto_them() {
+    let mut doc = text_page("BT /F1 12 Tf 72 700 Td (Name) Tj /F2 12 Tf 31.5 0 Td (abab) Tj /F1 12 Tf -31.5 -20 Td (Second line) Tj ET");
+    let long = "A name so long that on its own it would be wrapped at the right margin of the page and set over the line below";
+    text::replace_block(&mut doc, 0, 0, long).unwrap();
+    let doc = reopen(&doc);
+    let lines = text::text_lines(&doc, 0).unwrap();
+    let name = line_with(&lines, long);
+    assert!(name.rect[2] > 600.0, "one line, running off the page rather than over other text: {:?}", name.rect);
+    assert!((line_with(&lines, "abab").rect[0] - name.rect[2]).abs() < 0.01);
+    assert_eq!(line_with(&lines, "Second line").origin_baseline(), 680.0);
+}
+
+#[test]
+fn a_paragraph_keeps_its_left_edge_when_its_first_line_starts_after_a_lead_in() {
+    // "abab" (20.4 pt in the other font) opens the first line; the lines after it start at the
+    // left margin. The second line is the longest, so the lines share no right edge either.
+    let two = "BT /F2 10 Tf 72 700 Td (abab) Tj /F1 10 Tf 20.4 0 Td (was interviewed about the matter and) Tj \
+               -20.4 -12 Td (the client confirmed every one of the facts set out in the letter) Tj ET";
+    let three = "BT /F2 10 Tf 72 700 Td (abab) Tj /F1 10 Tf 20.4 0 Td (was interviewed about the matter and) Tj \
+                 -20.4 -12 Td (the client confirmed every one of the facts set out in the letter) Tj 0 -12 Td (and agreed to the fee.) Tj ET";
+    for src in [two, three] {
+        let mut doc = text_page(src);
+        let blocks = text::text_blocks(&doc, 0).unwrap();
+        let at = blocks.iter().position(|b| b.text.starts_with("was interviewed")).unwrap();
+        assert!(blocks[at].text.ends_with(if src == two { "in the letter" } else { "to the fee." }), "one paragraph: {:?}", blocks[at].text);
+        let right = blocks[at].rect[2];
+        let new = "was interviewed on the fourth of June about the matter, and the client confirmed every one of the facts set out in the \
+                   engagement letter, agreed to the fee and asked for a copy.";
+        text::replace_block(&mut doc, 0, at, new).unwrap();
+        let doc = reopen(&doc);
+        let lines = text::text_lines(&doc, 0).unwrap();
+        let block = text::text_blocks(&doc, 0).unwrap().into_iter().find(|b| b.text.starts_with("was interviewed")).unwrap();
+        assert_eq!(block.text, new);
+        assert!(block.lines.len() >= 3, "{:?}", block.lines);
+        for (n, i) in block.lines.iter().enumerate() {
+            let l = &lines[*i];
+            let want = if n == 0 { 92.4 } else { 72.0 };
+            assert!((l.rect[0] - want).abs() < 0.01, "line {n} starts at {}, not {want}: {}", l.rect[0], l.text);
+            assert!(l.rect[2] <= right + 1.0, "line {n} ends at {} within the paragraph's {right}: {}", l.rect[2], l.text);
+        }
+        let lead = line_with(&lines, "abab");
+        assert!((lead.rect[0] - 72.0).abs() < 0.01 && lead.origin_baseline() == 700.0, "the lead-in stays");
+    }
+}
+
+#[test]
+fn two_lines_that_start_apart_without_a_lead_in_are_set_as_before() {
+    // Centred lines start apart too; nothing says the second line's start is a left margin.
+    let mut doc = text_page("BT /F1 10 Tf 100 700 Td (A centred heading line) Tj 25 -12 Td (second part) Tj ET");
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks[0].lines.len(), 2, "{blocks:?}");
+    text::replace_block(&mut doc, 0, 0, "A centred heading line second part").unwrap();
+    let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+    assert!(lines.iter().all(|l| (l.rect[0] - 100.0).abs() < 0.01), "{:?}", lines.iter().map(|l| l.rect[0]).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_run_after_a_paragraphs_last_line_follows_it() {
+    // "the lazy" (35.21 pt) ends mid-line, and a run in another font carries on from it.
+    let mut doc = text_page(
+        "BT /F1 10 Tf 12 TL 72 700 Td (The quick brown fox jumps over) Tj T* (the lazy) Tj /F2 10 Tf 35.21 0 Td (abab) Tj \
+         /F1 10 Tf -35.21 -12 Td (Third line of other text here) Tj ET",
+    );
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks[0].text, "The quick brown fox jumps over the lazy");
+    // The same two lines, the second a little longer.
+    text::replace_block(&mut doc, 0, 0, "The quick brown fox jumps over the lazy red").unwrap();
+    let doc = reopen(&doc);
+    let lines = text::text_lines(&doc, 0).unwrap();
+    let (last, run) = (line_with(&lines, "the lazy red"), line_with(&lines, "abab"));
+    assert!((run.rect[0] - last.rect[2]).abs() < 0.01, "{} after {}", run.rect[0], last.rect[2]);
+    assert_eq!(run.origin_baseline(), 688.0);
+    let third = line_with(&lines, "Third line of other text here");
+    assert!((third.rect[0] - 72.0).abs() < 0.01 && third.origin_baseline() == 676.0, "{:?}", third.rect);
+}
+
+#[test]
+fn the_space_between_two_runs_on_a_row_survives_an_edit_to_either() {
+    // The second run starts with the space that separates it from the lead-in before it.
+    let mut doc = text_page("BT /F2 10 Tf 72 700 Td (abab) Tj /F1 10 Tf 20.4 0 Td ( opens the line) Tj ET");
+    let at = text::text_blocks(&doc, 0).unwrap().iter().position(|b| b.text == "opens the line").unwrap();
+    text::replace_block(&mut doc, 0, at, "opens this line").unwrap();
+    let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+    let gap = line_with(&lines, "opens this line").rect[0] - line_with(&lines, "abab").rect[2];
+    assert!((2.0..3.5).contains(&gap), "a space's width apart, not {gap}");
+    // The first run ends with the space before the run after it.
+    let mut doc = text_page("BT /F1 10 Tf 72 700 Td (the ) Tj /F2 10 Tf (abab) Tj ET");
+    text::replace_block(&mut doc, 0, 0, "this").unwrap();
+    let lines = text::text_lines(&reopen(&doc), 0).unwrap();
+    let gap = line_with(&lines, "abab").rect[0] - line_with(&lines, "this").rect[2];
+    assert!((2.0..3.5).contains(&gap), "a space's width apart, not {gap}");
+}

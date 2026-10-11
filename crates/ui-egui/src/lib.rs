@@ -118,6 +118,9 @@ use pdfcraft_engine::{DocId, Session};
 pub use canvas::{DocView, RasterMemory};
 pub use editing::{CloseRequest, SaveTarget};
 pub use files::{ExtractDraft, FilePurpose, FileRequest, RotateDraft, SplitDraft, SplitMode, SplitPlan};
+/// Lets edited text take a stand-in font from the fonts installed on this computer. The desktop
+/// app turns it on at start; tests and other embedders leave it off for machine-independent results.
+pub use pdfcraft_engine::use_system_fonts;
 pub use recovery::{AUTOSAVE_SECS, RecoveryMeta, RecoveryStore};
 use theme::{ThemeKind, ThemePreference};
 
@@ -574,6 +577,9 @@ pub struct PdfCraftApp {
     pub redact_search: RedactSearchDraft,
     pub hidden_draft: HiddenDraft,
     pub print_draft: PrintDraft,
+    /// Jobs on their way to the spooler: the printer and where each outcome arrives.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) print_jobs: Vec<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     pub link_draft: Option<LinkDraft>,
     /// The style new text gets (Edit a PDF ▸ Format text).
     pub text_style: pdfcraft_engine::AddedText,
@@ -781,6 +787,8 @@ impl PdfCraftApp {
             redact_search: RedactSearchDraft::default(),
             hidden_draft: HiddenDraft::default(),
             print_draft: PrintDraft::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            print_jobs: Vec::new(),
             link_draft: None,
             text_style: content_ui::default_style(),
             replace_draft: None,
@@ -1863,6 +1871,7 @@ impl eframe::App for PdfCraftApp {
         let now = ctx.input(|i| i.time);
         self.autosave_tick(now);
         self.poll_updates();
+        self.poll_print_jobs();
         // Shortcuts deferred last frame: the text field has taken that frame's typing since.
         let deferred = std::mem::take(&mut self.deferred_commands);
         self.shortcuts(ctx);

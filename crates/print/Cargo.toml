@@ -13,3 +13,9 @@ pdfcraft-cos = { workspace = true }
 pdfcraft-content = { workspace = true }
 pdfcraft-model = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Printing to a printer on Windows (src/win_spool.rs): the sheets are drawn here and sent to the
+# spooler as bitmaps. Both are lower layers; neither is built on other platforms.
+pdfcraft-render = { workspace = true }
+pdfcraft-winspool = { workspace = true }

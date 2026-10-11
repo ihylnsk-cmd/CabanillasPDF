@@ -34,6 +34,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("filters", Class::Standalone(0)),
     ("crypt", Class::Standalone(0)),
     ("arlington", Class::Standalone(0)),
+    // Win32 printing calls behind a safe API: the one crate allowed `unsafe` (its Cargo.toml).
+    ("winspool", Class::Standalone(0)),
     // L1 object layer
     ("cos", Class::Standalone(1)),
     // L2 core model

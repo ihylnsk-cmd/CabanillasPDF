@@ -66,7 +66,13 @@ impl PdfCraftApp {
     /// Help ▸ Check for updates: ask for the latest release and show the outcome.
     pub fn check_for_updates(&mut self) {
         let Some(source) = self.update_source.clone() else {
-            self.open_url(RELEASES_PAGE);
+            // The web build has no check of its own: the releases page says what is current. A
+            // desktop build without one is a modified build, whose versions come from elsewhere.
+            if cfg!(target_arch = "wasm32") {
+                self.open_url(RELEASES_PAGE);
+            } else {
+                self.notify("This is a modified build of PdfCraft. It doesn't check for updates; new versions come from whoever provided it.");
+            }
             return;
         };
         #[cfg(not(target_arch = "wasm32"))]

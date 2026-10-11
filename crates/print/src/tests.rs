@@ -469,3 +469,20 @@ fn printer_option_defaults_and_job_arguments() {
     assert!(args.ends_with("-o fit-to-page=false -o InputSlot=Tray2 -o EFMediaType=Heavy1"), "{args}");
     assert!(spool::printer_options("../../etc/passwd").is_empty(), "not a queue name");
 }
+
+#[test]
+fn copies_the_printer_cannot_make_are_sent_sheet_by_sheet() {
+    use crate::spool::send_order;
+    let s = |v: &[usize]| v.iter().map(|i| Some(*i)).collect::<Vec<_>>();
+    // The printer makes the copies: every sheet once.
+    assert_eq!(send_order(3, 1, true, true), s(&[0, 1, 2]));
+    // Collated: the whole document, copy after copy. Uncollated: each sheet in turn.
+    assert_eq!(send_order(3, 2, true, false), s(&[0, 1, 2, 0, 1, 2]));
+    assert_eq!(send_order(3, 2, false, false), s(&[0, 0, 1, 1, 2, 2]));
+    // Two-sided: an odd document gets a blank side between copies (not after the last), so
+    // no copy starts on the back of the one before; an even one needs none.
+    assert_eq!(send_order(3, 2, true, true), [Some(0), Some(1), Some(2), None, Some(0), Some(1), Some(2)]);
+    assert_eq!(send_order(3, 2, false, true), send_order(3, 2, true, true), "two-sided copies are sent whole");
+    assert_eq!(send_order(2, 3, true, true), s(&[0, 1, 0, 1, 0, 1]));
+    assert!(send_order(0, 5, true, true).is_empty() && send_order(1, 0, true, false) == s(&[0]));
+}

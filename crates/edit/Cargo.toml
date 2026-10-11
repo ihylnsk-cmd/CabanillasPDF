@@ -18,5 +18,13 @@ thiserror = { workspace = true }
 # Display order of right-to-left lines in added text; already in the tree via the interface.
 unicode-bidi = "0.3"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Stand-in fonts for edited text (src/sysfont.rs): find the document's own family among the fonts
+# installed on this computer, subset the glyphs the new text needs and embed them. All three are
+# pure Rust, MIT or MIT/Apache-2.0. The web build has no system fonts and leaves them out.
+fontdb = "0.24"
+ttf-parser = "0.25"
+subsetter = "0.2"
+
 [dev-dependencies]
 hayro-syntax = { workspace = true }

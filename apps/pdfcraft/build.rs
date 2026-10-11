@@ -21,6 +21,8 @@ fn main() {
         .set_manifest(windows_manifest::WINDOWS_MANIFEST)
         .set("ProductName", "PdfCraft")
         .set("FileDescription", "PdfCraft PDF workbench")
+        // Shown under Properties ▸ Details: this is a fork, and says so.
+        .set("Comments", "Modified build, not an official PdfCraft release. Based on PdfCraft, https://github.com/storytold/pdfcraft")
         .set("LegalCopyright", "Copyright (c) the PdfCraft contributors. MIT OR Apache-2.0.")
         .set("OriginalFilename", "pdfcraft.exe")
         .set("InternalName", "pdfcraft");

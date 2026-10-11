@@ -214,12 +214,20 @@ fn edge_at(b: Rect, p: Pos2) -> Option<Grip> {
     }
 }
 
-/// The topmost box under `p` and what it grabs there; edges only on an upright page.
+/// The box under `p` and what it grabs there; edges only on an upright page. Boxes can lie
+/// inside one another (a bold name inside the box of the paragraph it opens): the smallest one
+/// under `p` is the one meant, and of equals the topmost.
 fn grab_at(boxes: &[Rect], p: Pos2, upright: bool) -> Option<(usize, Grip)> {
-    boxes.iter().enumerate().rev().find_map(|(i, b)| match upright.then(|| edge_at(*b, p)).flatten() {
-        Some(g) => Some((i, g)),
-        None => b.contains(p).then_some((i, Grip::Move)),
-    })
+    boxes
+        .iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(i, b)| match upright.then(|| edge_at(*b, p)).flatten() {
+            Some(g) => Some((i, g, b.area())),
+            None => b.contains(p).then_some((i, Grip::Move, b.area())),
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(i, g, _)| (i, g))
 }
 
 /// What a right-click on a selected image asks for.
@@ -557,5 +565,25 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             })
         }
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_click_takes_the_smallest_box_under_it() {
+        // A bold name's box lies inside the box of the paragraph it opens, which comes later.
+        let name = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(180.0, 114.0));
+        let paragraph = Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(500.0, 160.0));
+        let boxes = [name, paragraph];
+        assert_eq!(grab_at(&boxes, Pos2::new(140.0, 107.0), true), Some((0, Grip::Move)), "on the name");
+        assert_eq!(grab_at(&boxes, Pos2::new(300.0, 107.0), true), Some((1, Grip::Move)), "beside the name");
+        assert_eq!(grab_at(&boxes, Pos2::new(300.0, 140.0), true), Some((1, Grip::Move)), "below the name");
+        assert_eq!(grab_at(&boxes, Pos2::new(499.0, 140.0), true), Some((1, Grip::Right)), "the paragraph's right edge");
+        assert_eq!(grab_at(&boxes, Pos2::new(600.0, 140.0), true), None);
+        // Two boxes of one size: the one drawn last, as before.
+        assert_eq!(grab_at(&[paragraph, paragraph], Pos2::new(300.0, 140.0), true), Some((1, Grip::Move)));
     }
 }

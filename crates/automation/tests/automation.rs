@@ -1695,6 +1695,41 @@ fn image_signatures_through_tools_preserve_transparency_and_survive_save() {
 }
 
 #[test]
+fn a_photographed_signature_is_cleaned_only_when_asked() {
+    let dir = workdir("photographed-signature");
+    // Grey paper (190), a dark stroke across the middle third: nothing in it is near white.
+    let photo = image::RgbImage::from_fn(300, 120, |x, y| {
+        if (100..200).contains(&x) && (55..65).contains(&y) { image::Rgb([20, 24, 90]) } else { image::Rgb([190, 190, 186]) }
+    });
+    photo.save(dir.join("photo.png")).unwrap();
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_create", json!({ "from": "blank", "width": 200, "height": 300 }))["doc"].as_u64().unwrap();
+    let render = |a: &mut Automation| {
+        let output = a.call("page_render", &json!({ "doc": doc, "page": 1, "dpi": 72 })).unwrap();
+        let Content::Png { data, .. } = &output[0] else { panic!() };
+        image::load_from_memory(data).unwrap().to_rgba8()
+    };
+    // As it is: the paper comes along as a grey box, 80 x 32 pt, with the stroke a third of it.
+    ok(&mut a, "fill_sign_add", json!({ "doc": doc, "page": 1, "type": "signature", "at": [20, 60], "path": "photo.png" }));
+    let boxed = render(&mut a);
+    assert_eq!(boxed.get_pixel(25, 50).0, [190, 190, 186, 255], "the paper is part of the signature");
+    ok(&mut a, "edit_undo", json!({ "doc": doc }));
+    // Cleaned: ink only, cropped to the stroke, so the stroke fills the signature box.
+    ok(&mut a, "fill_sign_add", json!({ "doc": doc, "page": 1, "type": "signature", "at": [20, 60], "path": "photo.png", "clean": true }));
+    let cleaned = render(&mut a);
+    let ink: Vec<(u32, u32)> = cleaned.enumerate_pixels().filter(|(_, _, p)| p.0[0] < 100).map(|(x, y, _)| (x, y)).collect();
+    let (left, right) = (ink.iter().map(|p| p.0).min().unwrap(), ink.iter().map(|p| p.0).max().unwrap());
+    assert!(right - left > 120, "the stroke spans most of the 150 pt box: {left}..{right}");
+    assert!(cleaned.pixels().all(|p| p.0[0] < 100 || p.0[0] > 250), "nothing of the grey paper is left");
+    let (x, y) = ink[ink.len() / 2];
+    let p = cleaned.get_pixel(x, y).0;
+    assert!(p[2] > p[0] + 40, "the ink keeps its colour: {p:?}");
+    assert!(
+        a.call("fill_sign_add", &json!({ "doc": doc, "page": 1, "type": "signature", "at": [20, 90], "path": "photo.png", "clean": "yes" })).is_err()
+    );
+}
+
+#[test]
 fn image_signature_preview_layers_are_read_only_and_survive_encrypted_save() {
     let dir = workdir("signature-preview");
     let mut png = Vec::new();

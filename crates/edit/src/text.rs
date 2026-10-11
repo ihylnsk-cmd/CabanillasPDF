@@ -44,6 +44,30 @@ pub struct TextLine {
     ops: Vec<usize>,
     /// Where the line starts: text matrix (text space), the state there, and its `BT`.
     origin: Origin,
+    /// Where it ends, in user space, and each of its operators with the matrices around it.
+    end: [f64; 2],
+    shows: Vec<ShowAt>,
+}
+
+/// One text-showing operator of a line: where it starts and what it leaves behind.
+#[derive(Clone, Debug, PartialEq)]
+struct ShowAt {
+    op: usize,
+    /// The text matrix it starts at, the text line matrix there, and the text matrix after it.
+    tm: [f64; 6],
+    tlm: [f64; 6],
+    end_tm: [f64; 6],
+    /// The font size and horizontal scaling there (text space): what a `TJ` number moves by.
+    size: f64,
+    scale: f64,
+    /// `'` or `"`: it moves to the next line before it shows its text.
+    quote: bool,
+}
+
+impl ShowAt {
+    fn of(s: &Shown) -> Self {
+        ShowAt { op: s.op, tm: s.tm.0, tlm: s.tlm.0, end_tm: s.end_tm.0, size: s.state.size, scale: s.state.scale, quote: s.quote }
+    }
 }
 
 /// Text and graphics state captured for rewriting.
@@ -126,6 +150,126 @@ impl TextLine {
     /// The baseline's height in user space.
     pub fn origin_baseline(&self) -> f64 {
         self.origin.baseline
+    }
+
+    /// Where the line starts, in user space.
+    fn start(&self) -> [f64; 2] {
+        [self.origin.x, self.origin.baseline]
+    }
+
+    /// The direction the line runs in, in user space (a unit vector).
+    fn dir(&self) -> [f64; 2] {
+        let m = Matrix(self.origin.tm).then(&Matrix(self.origin.ctm));
+        let len = m.0[0].hypot(m.0[1]);
+        if len > 0.0 && len.is_finite() { [m.0[0] / len, m.0[1] / len] } else { [1.0, 0.0] }
+    }
+}
+
+/// How far `to` lies from `from` along the unit vector `u`, and to its left.
+fn along_across(from: [f64; 2], to: [f64; 2], u: [f64; 2]) -> (f64, f64) {
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    (dx * u[0] + dy * u[1], dy * u[0] - dx * u[1])
+}
+
+/// Whether `next` carries on where a run ending at `end` (size `size`, direction `u`) stops:
+/// the same baseline and direction, starting within a word space or so of the end. Runs of one
+/// visual line are like this (a bold name and the sentence it opens); table cells are not.
+fn continues(end: [f64; 2], size: f64, u: [f64; 2], next: &TextLine) -> Option<f64> {
+    let d = next.dir();
+    let (along, across) = along_across(end, next.start(), u);
+    let reach = size.max(next.size).max(1.0);
+    (d[0] * u[0] + d[1] * u[1] > 0.99 && across.abs() < reach * 0.3 && along > -reach * 0.5 && along < reach * 1.2).then_some(along)
+}
+
+/// The lines that carry on from line `of` on its row, nearest first, leaving out `skip`ped ones.
+fn followers(lines: &[TextLine], of: usize, skip: &dyn Fn(usize) -> bool) -> Vec<usize> {
+    let Some(first) = lines.get(of) else { return Vec::new() };
+    let u = first.dir();
+    let (mut end, mut size) = (first.end, first.size);
+    let mut chain: Vec<usize> = Vec::new();
+    // A row has a handful of runs; the cap is for hostile pages.
+    while chain.len() < 256 {
+        let next = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != of && !chain.contains(i) && !skip(*i))
+            .filter_map(|(i, l)| continues(end, size, u, l).map(|along| (i, along, l)))
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        let Some((i, _, l)) = next else { break };
+        chain.push(i);
+        (end, size) = (l.end, l.size);
+    }
+    chain
+}
+
+/// Where the row of line `of` starts when other runs lead up to it on its baseline (a bold name
+/// before the sentence it opens): the start of the leftmost of them. `None` when the line
+/// starts its row.
+fn row_start(lines: &[TextLine], of: usize) -> Option<[f64; 2]> {
+    let first = lines.get(of)?;
+    let u = first.dir();
+    let mut at = of;
+    let mut found = None;
+    // Runs of a row sit close together in the content; look that far and no further.
+    let near = of.saturating_sub(256)..(of + 257).min(lines.len());
+    for _ in 0..64 {
+        let cur = lines.get(at)?;
+        let before =
+            near.clone().filter(|i| *i != at && *i != of).find(|i| lines.get(*i).is_some_and(|l| continues(l.end, l.size, u, cur).is_some()));
+        let Some(i) = before else { break };
+        at = i;
+        found = lines.get(i).map(TextLine::start);
+    }
+    found
+}
+
+/// Operators to insert before others, by operator index: first what puts the text state back
+/// after a moved run, then what places the next one.
+#[derive(Default)]
+struct Inserts {
+    restore: HashMap<usize, Vec<Op>>,
+    place: HashMap<usize, Vec<Op>>,
+}
+
+impl Inserts {
+    fn take(&mut self, at: usize) -> Vec<Op> {
+        let mut ops = self.restore.remove(&at).unwrap_or_default();
+        ops.extend(self.place.remove(&at).unwrap_or_default());
+        ops
+    }
+}
+
+/// Draw the lines `chain` moved by `shift` (user space). Each of their operators is placed where
+/// it was plus the shift, whether it was positioned or simply carried on from the text before
+/// it; after each line the text line matrix and the pen are put back, so what comes after it
+/// stays where it is.
+fn move_lines(lines: &[TextLine], chain: &[usize], shift: [f64; 2], inserts: &mut Inserts) {
+    let n = pdfcraft_content::num;
+    for line in chain.iter().filter_map(|i| lines.get(*i)) {
+        // The shift in the space the text matrix is in (before the CTM). A line that can't be
+        // placed stops the row there: moving the ones after it would run them into it.
+        let c = line.origin.ctm;
+        let Some(back) = Matrix([c[0], c[1], c[2], c[3], 0.0, 0.0]).invert() else { break };
+        let (sx, sy) = back.apply(shift[0], shift[1]);
+        // ' and " move down a line themselves; placing them first would move them twice.
+        if line.shows.iter().any(|s| s.quote) || !(sx.is_finite() && sy.is_finite()) {
+            break;
+        }
+        for s in &line.shows {
+            let t = s.tm;
+            inserts.place.entry(s.op).or_default().push(Op::new("Tm", vec![n(t[0]), n(t[1]), n(t[2]), n(t[3]), n(t[4] + sx), n(t[5] + sy)]));
+        }
+        let Some(last) = line.shows.last() else { continue };
+        let after = inserts.restore.entry(last.op + 1).or_default();
+        after.push(Op::new("Tm", last.tlm.iter().map(|v| n(*v)).collect()));
+        // The pen: along the text line, from the line matrix's origin to where the run ended.
+        let (a, b) = (last.tlm[0], last.tlm[1]);
+        let norm = a * a + b * b;
+        let advance = if norm > 0.0 { ((last.end_tm[4] - last.tlm[4]) * a + (last.end_tm[5] - last.tlm[5]) * b) / norm } else { 0.0 };
+        let unit = last.size * last.scale;
+        if advance.is_finite() && advance.abs() > 1e-6 && unit.abs() > 1e-9 {
+            after.push(Op::new("TJ", vec![Object::Array(vec![n(-advance / unit * 1000.0)])]));
+        }
     }
 }
 
@@ -261,6 +405,10 @@ struct Shown {
     baseline: f64,
     start_x: f64,
     end_x: f64,
+    end_y: f64,
+    /// The text matrix after it, and whether it is a `'` or `"` (which move down a line first).
+    end_tm: Matrix,
+    quote: bool,
     bt: usize,
     font: Vec<u8>,
     base_font: String,
@@ -449,6 +597,9 @@ fn interpret(
                     baseline: start.1,
                     start_x: start.0,
                     end_x: end.0,
+                    end_y: end.1,
+                    end_tm: tm,
+                    quote: matches!(op.op.as_slice(), b"'" | b"\""),
                     bt,
                     font: name,
                     base_font: m.base_font.clone(),
@@ -503,6 +654,8 @@ pub fn text_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, EditErro
             l.text.push_str(&s.text);
             l.rect = [l.rect[0].min(s.rect[0]), l.rect[1].min(s.rect[1]), l.rect[2].max(s.rect[2]), l.rect[3].max(s.rect[3])];
             l.ops.push(s.op);
+            l.end = [s.end_x, s.end_y];
+            l.shows.push(ShowAt::of(&s));
             l.decodable &= s.decodable;
             l.color = fill_color(&s.state.fill);
         } else {
@@ -529,6 +682,8 @@ pub fn text_lines(doc: &Document, page: usize) -> Result<Vec<TextLine>, EditErro
                     bt_op: s.bt_op,
                     bt_state: TextState::of(&s.bt_state),
                 },
+                end: [s.end_x, s.end_y],
+                shows: vec![ShowAt::of(&s)],
             });
         }
         last = Some((si, s.bt, s.baseline, s.end_x, s.size.max(1.0)));
@@ -559,6 +714,8 @@ fn add_shown(lines: &mut Vec<TextLine>, last: &mut Option<(usize, f64, f64, f64)
         l.text.push_str(&s.text);
         l.rect = [l.rect[0].min(s.rect[0]), l.rect[1].min(s.rect[1]), l.rect[2].max(s.rect[2]), l.rect[3].max(s.rect[3])];
         l.ops.push(s.op);
+        l.end = [s.end_x, s.end_y];
+        l.shows.push(ShowAt::of(&s));
         l.decodable &= s.decodable;
         l.color = fill_color(&s.state.fill);
     } else {
@@ -585,6 +742,8 @@ fn add_shown(lines: &mut Vec<TextLine>, last: &mut Option<(usize, f64, f64, f64)
                 bt_op: s.bt_op,
                 bt_state: TextState::of(&s.bt_state),
             },
+            end: [s.end_x, s.end_y],
+            shows: vec![ShowAt::of(&s)],
         });
     }
     *last = Some((s.bt, s.baseline, s.end_x, s.size.max(1.0)));
@@ -721,12 +880,41 @@ fn source_family(base_font: &str) -> crate::added::Family {
     if ["courier", "mono", "consolas", "menlo", "monaco", "lucida console"].iter().any(|s| name.contains(s)) {
         crate::added::Family::Courier
     } else if !name.contains("sans")
-        && ["times", "serif", "roman", "mincho", "cambria", "georgia", "palatino", "garamond"].iter().any(|s| name.contains(s))
+        && [
+            "times",
+            "serif",
+            "roman",
+            "mincho",
+            "cambria",
+            "caladea",
+            "georgia",
+            "palatino",
+            "garamond",
+            "tinos",
+            "constantia",
+            "bookman",
+            "century",
+            "minion",
+            "charter",
+            "baskerville",
+            "didot",
+            "cmr",
+            "cmbx",
+            "cmti",
+        ]
+        .iter()
+        .any(|s| name.contains(s))
     {
         crate::added::Family::Times
     } else {
         crate::added::Family::Helvetica
     }
+}
+
+/// What a stand-in from this computer's fonts should match: the source font and its style.
+fn system_style(base_font: &str, bold: bool, italic: bool) -> crate::sysfont::Style<'_> {
+    let family = source_family(base_font);
+    crate::sysfont::Style { base_font, bold, italic, serif: family == crate::added::Family::Times, mono: family == crate::added::Family::Courier }
 }
 
 const SUBSTITUTE_NAME: &str = "PCEdHelv";
@@ -913,6 +1101,11 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
     let reused = font.as_ref().and_then(|m| m.encode(&text));
     let mut substituted = None;
     let mut replacement: Vec<Op> = Vec::new();
+    // How wide the new text is (text space, before horizontal scaling): the runs that carry on
+    // from this one on its row move with its end.
+    let st = target.origin.state.clone();
+    let spacing = text.chars().count() as f64 * st.char_spacing;
+    let mut new_advance: Option<f64> = None;
     // ' and " also move to the next line; keep that.
     match ops[first].op.as_slice() {
         b"'" => replacement.push(Op::new("T*", vec![])),
@@ -924,17 +1117,64 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
         _ => {}
     }
     match reused {
-        Some(bytes) => replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(bytes))])),
+        Some(bytes) => {
+            if let (Some(m), Some((_, size))) = (&font, &st.font) {
+                let codes = m.codes(&bytes);
+                new_advance = Some(
+                    codes.iter().map(|(c, l)| m.width(*c) * size + st.char_spacing + if m.is_space(*c, *l) { st.word_spacing } else { 0.0 }).sum(),
+                );
+            }
+            replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(bytes))]));
+        }
         None => {
-            if needs_type3(&text) {
-                let fallback = type3_font(doc, &mut fonts_res, &text, source_family(&target.base_font), target.bold)?;
-                let bytes = type3_encode(&fallback, &text)
-                    .ok_or_else(|| EditError::Invalid(format!("\"{text}\" can't be shown by the Japanese fallback")))?;
-                let size = font_size_before(&ops, first).unwrap_or(target.size);
-                replacement.push(Op::new("Tf", vec![Object::name(&fallback.name), pdfcraft_content::num(size)]));
+            // The size in text space: the current Tf's size.
+            let size = font_size_before(&ops, first).unwrap_or(target.size);
+            let style = system_style(&target.base_font, target.bold, target.italic);
+            let show_in = |replacement: &mut Vec<Op>, font: &str, bytes: Vec<u8>| {
+                replacement.push(Op::new("Tf", vec![Object::name(font), pdfcraft_content::num(size)]));
                 replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(bytes))]));
                 replacement.push(Op::new("Tf", vec![Object::name(&target.font), pdfcraft_content::num(size)]));
-                substituted = Some(format!("{} Type3", fallback.family));
+            };
+            // First the same typeface from this computer's fonts (when the app allows it), so the
+            // line keeps its look; then the installed twin of the standard font it would otherwise
+            // get (Times New Roman for a serif source, Arial, Courier New), which is embedded and
+            // whose widths are known exactly; then what the document can always fall back to.
+            let kind = source_family(&target.base_font);
+            let standard = crate::sysfont::Style {
+                base_font: kind.base_font(target.bold, target.italic),
+                bold: target.bold,
+                italic: target.italic,
+                serif: kind == crate::added::Family::Times,
+                mono: kind == crate::added::Family::Courier,
+            };
+            let system = |doc: &mut Document, fonts_res: &mut Dict, style: &crate::sysfont::Style, generic: bool| {
+                let font = crate::sysfont::embed(doc, fonts_res, &text, style, generic)?;
+                let bytes = font.encode(&text)?;
+                Some((font, bytes))
+            };
+            let installed = system(doc, &mut fonts_res, &style, false).or_else(|| system(doc, &mut fonts_res, &standard, false));
+            if let Some((font, bytes)) = installed {
+                new_advance = Some(font.advance(&text) * size + spacing);
+                show_in(&mut replacement, &font.name, bytes);
+                substituted = Some(font.family);
+            } else if needs_type3(&text) {
+                match type3_font(doc, &mut fonts_res, &text, source_family(&target.base_font), target.bold) {
+                    Ok(fallback) => {
+                        let bytes = type3_encode(&fallback, &text)
+                            .ok_or_else(|| EditError::Invalid(format!("\"{text}\" can't be shown by the Japanese fallback")))?;
+                        let widths: f64 = fallback.codes.iter().map(|(ch, _, width)| text.chars().filter(|c| c == ch).count() as f64 * width).sum();
+                        new_advance = Some(widths * size + spacing);
+                        show_in(&mut replacement, &fallback.name, bytes);
+                        substituted = Some(format!("{} Type3", fallback.family));
+                    }
+                    // No bundled face has the characters: any installed font of the same kind that does.
+                    Err(e) => {
+                        let (font, bytes) = system(doc, &mut fonts_res, &style, true).ok_or(e)?;
+                        new_advance = Some(font.advance(&text) * size + spacing);
+                        show_in(&mut replacement, &font.name, bytes);
+                        substituted = Some(font.family);
+                    }
+                }
             } else {
                 let win = pdfcraft_fonts::win_ansi(&text);
                 // WinAnsi turns what it can't show into '?'; refuse rather than print the wrong thing.
@@ -942,14 +1182,17 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
                 if text.chars().zip(back.chars()).any(|(a, b)| b == '?' && a != '?') {
                     return Err(EditError::Invalid(format!("\"{text}\" has characters neither {} nor Helvetica can show", target.base_font)));
                 }
-                // The size in text space: the current Tf's size.
-                let size = font_size_before(&ops, first).unwrap_or(target.size);
                 let family = source_family(&target.base_font);
                 let base = family.base_font(target.bold, target.italic);
+                // The standard fonts' widths as the paragraph editor takes them.
+                let glyphs = match family {
+                    crate::added::Family::Courier => text.chars().count() as f64 * 0.6 * size,
+                    crate::added::Family::Times => pdfcraft_fonts::helvetica_width(&text, size) * 0.92,
+                    crate::added::Family::Helvetica => pdfcraft_fonts::helvetica_width(&text, size) * if target.bold { 1.05 } else { 1.0 },
+                };
+                new_advance = Some(glyphs + spacing + text.matches(' ').count() as f64 * st.word_spacing);
                 let substitute_name = format!("PCEd{}", base.replace('-', ""));
-                replacement.push(Op::new("Tf", vec![Object::name(&substitute_name), pdfcraft_content::num(size)]));
-                replacement.push(Op::new("Tj", vec![Object::String(PdfString::literal(win))]));
-                replacement.push(Op::new("Tf", vec![Object::name(&target.font), pdfcraft_content::num(size)]));
+                show_in(&mut replacement, &substitute_name, win);
                 substituted = Some(base.to_string());
                 let mut f = Dict::new();
                 f.set(b"Type".to_vec(), Object::name("Font"));
@@ -963,7 +1206,23 @@ pub fn replace_line(doc: &mut Document, page: usize, line: usize, text: &str) ->
     // Rebuild: the line's first operator becomes the replacement, its others go. Copies of the
     // line drawn in the same area go too, so the replacement is all that shows.
     let drops = coincident_ops(&lines, std::slice::from_ref(&target.rect));
-    let new_data = splice(&pieces, &ops, |i| if i == first { (std::mem::take(&mut replacement), false) } else { (Vec::new(), !drops.contains(&i)) });
+    // The runs that carry on from this one on its row follow its new end.
+    let mut inserts = Inserts::default();
+    let chain = followers(&lines, line, &|i| lines.get(i).is_none_or(|l| l.ops.iter().all(|op| drops.contains(op))));
+    if let Some(advance) = new_advance.filter(|_| !chain.is_empty()) {
+        let u = target.dir();
+        let shift = advance * st.scale * target.origin.k - along_across(target.start(), target.end, u).0;
+        move_lines(&lines, &chain, [shift * u[0], shift * u[1]], &mut inserts);
+    }
+    let new_data = splice(&pieces, &ops, |i| {
+        let mut insert = inserts.take(i);
+        if i == first {
+            insert.extend(std::mem::take(&mut replacement));
+            (insert, false)
+        } else {
+            (insert, !drops.contains(&i))
+        }
+    });
     let contents = rewritten_contents(doc, &streams, new_data);
     let page_ref = p.obj;
     if substituted.is_some() {
@@ -1025,6 +1284,25 @@ fn aligned(a: &TextLine, b: &TextLine) -> bool {
     (a.origin.x - b.origin.x).abs() < tol || (centre(a.rect) - centre(b.rect)).abs() < tol || (a.rect[2] - b.rect[2]).abs() < tol
 }
 
+/// The baseline gap from `prev` down to `l` when `l` can be the next line of `prev`'s paragraph:
+/// the same stream, font, size, style and colour, aligned, and one to two and a half sizes below.
+/// `row_x` is where `prev`'s row starts when other runs lead up to it ([`row_start`]): a line
+/// that starts there lines up with the row, though not with `prev` itself.
+fn follows(prev: &TextLine, l: &TextLine, row_x: Option<f64>) -> Option<f64> {
+    let g = prev.origin.baseline - l.origin.baseline;
+    (prev.stream == l.stream
+        && prev.font == l.font
+        && prev.base_font == l.base_font
+        && prev.bold == l.bold
+        && prev.italic == l.italic
+        && prev.color == l.color
+        && (prev.size - l.size).abs() < 0.01
+        && (aligned(prev, l) || row_x.is_some_and(|x| (x - l.origin.x).abs() < l.size.max(1.0)))
+        && g > l.size * 0.8
+        && g < l.size * 2.5)
+        .then_some(g)
+}
+
 fn group_blocks(lines: &[TextLine]) -> Vec<TextBlock> {
     let mut blocks: Vec<TextBlock> = Vec::new();
     let mut gap: Option<f64> = None;
@@ -1032,19 +1310,15 @@ fn group_blocks(lines: &[TextLine]) -> Vec<TextBlock> {
         let joins = i > 0
             && blocks.last().is_some_and(|b| {
                 let Some(&p) = b.lines.last() else { return false };
-                let prev = &lines[p];
-                let g = prev.origin.baseline - l.origin.baseline;
-                prev.stream == l.stream
-                    && prev.font == l.font
-                    && prev.base_font == l.base_font
-                    && prev.bold == l.bold
-                    && prev.italic == l.italic
-                    && prev.color == l.color
-                    && (prev.size - l.size).abs() < 0.01
-                    && aligned(prev, l)
-                    && g > l.size * 0.8
-                    && g < l.size * 2.5
-                    && gap.is_none_or(|first| (g - first).abs() < first * 0.2)
+                // Only a paragraph's first line can come after a lead-in on its row.
+                let row_x = if b.lines.len() == 1 { row_start(lines, p).map(|start| start[0]) } else { None };
+                let Some(g) = follows(&lines[p], l, row_x) else { return false };
+                // The first gap sets the paragraph's line spacing. A one-line block doesn't take
+                // the first line of the paragraph below it: when the line after this one sits
+                // clearly closer than this one does to the block, the wide gap was the space
+                // between two paragraphs ("…named below." / blank / "The provider will…").
+                let starts_next = gap.is_none() && lines.get(i + 1).and_then(|next| follows(l, next, None)).is_some_and(|after| g > after * 1.2);
+                !starts_next && gap.is_none_or(|first| (g - first).abs() < first * 0.2)
             });
         if joins
             && let Some(b) = blocks.last_mut()
@@ -1084,12 +1358,19 @@ fn paragraph_separator(c: char) -> bool {
 }
 
 /// Greedy word wrapping to `width` with `advance` giving a string's width.
+#[cfg(test)]
 fn wrap(text: &str, width: f64, advance: impl Fn(&str) -> f64) -> Vec<String> {
+    wrap_lines(text, |_| width, usize::MAX, advance)
+}
+
+/// Greedy word wrapping with `advance` giving a string's width: line `i` is `width(i)` wide,
+/// and there are at most `most` lines (the last takes whatever is left).
+fn wrap_lines(text: &str, width: impl Fn(usize) -> f64, most: usize, advance: impl Fn(&str) -> f64) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split(paragraph_separator).filter(|word| !word.is_empty()) {
         let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-        if !line.is_empty() && advance(&candidate) > width {
+        if !line.is_empty() && out.len().saturating_add(1) < most && advance(&candidate) > width(out.len()) {
             out.push(std::mem::take(&mut line));
             line = word.to_string();
         } else {
@@ -1161,13 +1442,52 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
     if let Some(sc) = style.scale {
         ts_state.scale = (sc / 100.0).clamp(0.1, 10.0);
     }
-    let o_state = ts_state.clone();
+    // The new text is set without the source's word spacing (a justified source stretches its
+    // spaces), so its widths are measured without it too.
+    let mut o_state = ts_state.clone();
+    o_state.word_spacing = 0.0;
     let metrics = fonts_res.get(font_name.as_bytes()).and_then(|f| doc.resolve(f).as_dict().cloned()).map(|d| Metrics::from_dict(doc, &d));
     let reuse = style.family.is_none() && style.bold.is_none() && metrics.as_ref().is_some_and(|m| m.encode(&text).is_some());
     // The chosen style also determines the real Japanese fallback outlines and advances.
     let (family, bold, italic) = style.family.unwrap_or((source_family(&b.base_font), b.bold, b.italic));
     let bold = style.bold.unwrap_or(bold);
-    let type3 = if !reuse && needs_type3(&text) { Some(type3_font(doc, &mut fonts_res, &text, family, bold)?) } else { None };
+    // The paragraph's own typeface from this computer's fonts (when the app allows it and no
+    // other family was asked for) comes before the standard fonts, so an edit keeps its look.
+    let source_style = system_style(&b.base_font, bold, italic);
+    let mut system = if !reuse && style.family.is_none() { crate::sysfont::embed(doc, &mut fonts_res, &text, &source_style, false) } else { None };
+    // Then the installed twin of the standard font the paragraph would otherwise get (Times New
+    // Roman for a serif source, Arial, Courier New): embedded, and measured exactly, where the
+    // standard fonts are neither.
+    if system.is_none() && !reuse && style.family.is_none() {
+        let standard = crate::sysfont::Style {
+            base_font: family.base_font(bold, italic),
+            bold,
+            italic,
+            serif: family == crate::added::Family::Times,
+            mono: family == crate::added::Family::Courier,
+        };
+        system = crate::sysfont::embed(doc, &mut fonts_res, &text, &standard, false);
+    }
+    let type3 = if system.is_none() && !reuse && needs_type3(&text) {
+        match type3_font(doc, &mut fonts_res, &text, family, bold) {
+            Ok(fallback) => Some(fallback),
+            // No bundled face has the characters: any installed font of the same kind that does.
+            Err(e) => {
+                let asked = crate::sysfont::Style {
+                    base_font: &b.base_font,
+                    bold,
+                    italic,
+                    serif: family == crate::added::Family::Times,
+                    mono: family == crate::added::Family::Courier,
+                };
+                system = Some(crate::sysfont::embed(doc, &mut fonts_res, &text, &asked, true).ok_or(e)?);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let system = system.map(Rc::new);
     let std_width = move |s: &str, size: f64| -> f64 {
         match family {
             crate::added::Family::Courier => s.chars().count() as f64 * 0.6 * size,
@@ -1199,6 +1519,7 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
                         .sum::<f64>()
                 })
                 .unwrap_or(0.0),
+            _ if let Some(font) = &system => font.advance(s) * size + s.chars().count() as f64 * o_state.char_spacing,
             _ if let Some(fallback) = &type3 => {
                 fallback.codes.iter().map(|(ch, _, width)| s.chars().filter(|c| c == ch).count() as f64 * width * size).sum::<f64>()
                     + s.chars().count() as f64 * o_state.char_spacing
@@ -1207,11 +1528,65 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
         };
         t * o_state.scale * k
     };
-    let wrapped = wrap(&text, width + 0.5, advance);
+    // Where the lines after the first start, measured along the first line from its start. A
+    // paragraph's first line may start somewhere else: after a lead-in set in another font (a
+    // bold name before the sentence), indented, or to the left of the rest (a numbered item).
+    // The rest then keep their own left edge, and each line is as wide as its start allows.
+    let u = first.dir();
+    let from_first = |p: [f64; 2]| along_across(first.start(), p, u).0;
+    let rest: Vec<f64> = members.iter().skip(1).map(|l| from_first(l.start())).collect();
+    let (rest_left, rest_far) = rest.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+    let lead_in = b.lines.first().and_then(|i| row_start(&lines, *i)).map(from_first);
+    let own_alignment = matches!(style.align, Some(crate::added::Align::Center | crate::added::Align::Right));
+    // Two lines alone don't tell an indent from centred or right-aligned text; a lead-in that
+    // starts where the second line does settles it.
+    let hang = if !rest.is_empty()
+        && !own_alignment
+        && rest_far - rest_left < 0.75
+        && rest_left.abs() > 0.75
+        && (rest.len() >= 2 || lead_in.is_some_and(|x| (x - rest_left).abs() < first.size.max(1.0)))
+    {
+        rest_left
+    } else {
+        0.0
+    };
+    // The paragraph's measure: with a first line of its own, the other lines say how far right
+    // the text goes (the first may have been pushed out by an edit to the lead-in before it).
+    let measure = if hang != 0.0 && style.width.is_none() {
+        let right = members.iter().skip(1).map(|l| from_first(l.end)).fold(f64::NEG_INFINITY, f64::max);
+        let m = right - hang.min(0.0);
+        if m.is_finite() { m.max(size * k) } else { width }
+    } else {
+        width
+    };
+    // A run that opens after a lead-in often starts with the space between the two, and one that
+    // other runs follow may end with it. The paragraph's text is kept without either, so they
+    // are put back as distances.
+    let space = Some(advance(" ")).filter(|w| *w > 0.0).unwrap_or(size * k * 0.25);
+    let lead_space = if lead_in.is_some() && first.text.starts_with(paragraph_separator) { space } else { 0.0 };
+    let line_width = |i: usize| (if i == 0 { measure + hang.min(0.0) - lead_space } else { measure - hang.max(0.0) }).max(size * k);
+    // The paragraph's operators go, and so does anything drawn in the same area (a fake-bold
+    // second copy, an invisible text layer): the new text is all that may show.
+    let member_rects: Vec<[f64; 4]> = members.iter().map(|l| l.rect).collect();
+    let mut drop = coincident_ops(&lines, &member_rects);
+    drop.extend(members.iter().flat_map(|l| l.ops.iter().copied()));
+    // Other runs may carry on from the paragraph's last line on its row (the sentence after a
+    // bold name; the rest of a line after a word in italics). They move with the end of that
+    // line. The text can't wrap onto more lines then: it would be set over the row's other runs.
+    let chain = b
+        .lines
+        .last()
+        .map_or_else(Vec::new, |last| followers(&lines, *last, &|i| lines.get(i).is_none_or(|l| l.ops.iter().all(|op| drop.contains(op)))));
+    let in_place = dx == 0.0 && dy == 0.0 && style.width.is_none();
+    let most = if in_place && !chain.is_empty() { members.len() } else { usize::MAX };
+    let wrapped = wrap_lines(&text, |i| line_width(i) + 0.5, most, advance);
     let mut substituted = None;
     let new_font = !reuse;
     let (show_font, encode): (String, Encoder) = if let Some(m) = metrics.clone().filter(|_| reuse) {
         (font_name.clone(), Box::new(move |s: &str| m.encode(s)))
+    } else if let Some(font) = system.clone() {
+        substituted = Some(font.family.clone());
+        (font.name.clone(), Box::new(move |s: &str| font.encode(s)))
     } else if let Some(fallback) = type3.clone() {
         let name = fallback.name.clone();
         let encoder = fallback.clone();
@@ -1265,30 +1640,35 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
     }
     block_ops.extend(state.ops());
     block_ops.push(Op::new("Tm", o.tm.iter().map(|v| n(*v)).collect()));
-    // Alignment: each line's offset from the left edge, in text space.
-    let offset = |line: &str| -> f64 {
-        let free = (width - advance(line)).max(0.0) / k;
-        match style.align {
+    // Each line's offset from the first line's start, in text space: where the lines after the
+    // first begin, and the alignment within the line's width.
+    let offset = |i: usize, line: &str| -> f64 {
+        let free = (line_width(i) - advance(line)).max(0.0) / k;
+        let aligned = match style.align {
             Some(crate::added::Align::Center) => free / 2.0,
             Some(crate::added::Align::Right) => free,
             _ => 0.0,
-        }
+        };
+        aligned + if i > 0 { hang } else { lead_space } / k
     };
     // Justify: word spacing (single-byte code 32 only) so each line but the last fills the width.
-    let single_byte = !reuse || metrics.as_ref().is_some_and(|m| !m.composite);
+    let single_byte = if reuse { metrics.as_ref().is_some_and(|m| !m.composite) } else { system.is_none() };
     let justify = style.align == Some(crate::added::Align::Justify) && single_byte;
     let mut x = 0.0;
     let mut tw_set = 0.0;
     let mut underlines: Vec<(f64, f64, f64)> = Vec::new(); // (x0, x1, y) in text space
     for (i, line) in wrapped.iter().enumerate() {
-        let dx = offset(line);
+        let dx = offset(i, line);
         if i > 0 || dx != 0.0 {
             block_ops.push(Op::new("Td", vec![n(dx - x), n(if i > 0 { -lead } else { 0.0 })]));
         }
         x = dx;
         let spaces = line.matches(' ').count();
-        let tw =
-            if justify && i + 1 < wrapped.len() && spaces > 0 { (width - advance(line)).max(0.0) / k / o_state.scale / spaces as f64 } else { 0.0 };
+        let tw = if justify && i + 1 < wrapped.len() && spaces > 0 {
+            (line_width(i) - advance(line)).max(0.0) / k / o_state.scale / spaces as f64
+        } else {
+            0.0
+        };
         if tw != tw_set {
             block_ops.push(Op::new("Tw", vec![n(tw)]));
             tw_set = tw;
@@ -1317,7 +1697,7 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
         block_ops.push(Op::new("cm", o.tm.iter().map(|v| n(*v)).collect()));
         block_ops.extend(colour);
         block_ops.push(Op::new("w", vec![n(size * 0.06)]));
-        for (x0, x1, y) in underlines {
+        for &(x0, x1, y) in &underlines {
             block_ops.push(Op::new("m", vec![n(x0), n(y)]));
             block_ops.push(Op::new("l", vec![n(x1), n(y)]));
         }
@@ -1325,11 +1705,18 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
         block_ops.push(Op::new("Q", vec![]));
     }
     block_ops.push(Op::new("Q", vec![]));
-    // The paragraph's operators go, and so does anything drawn in the same area (a fake-bold
-    // second copy, an invisible text layer): the new text is all that may show.
-    let member_rects: Vec<[f64; 4]> = members.iter().map(|l| l.rect).collect();
-    let mut drop = coincident_ops(&lines, &member_rects);
-    drop.extend(members.iter().flat_map(|l| l.ops.iter().copied()));
+    // The runs after the last line on its row: placed where the line now ends, when the text
+    // was edited where it stands and still has as many lines; where they were otherwise. Placed
+    // either way, because a run that simply carried on from the text before it has nothing to
+    // carry on from once that text is drawn somewhere else.
+    let mut inserts = Inserts::default();
+    if !chain.is_empty() {
+        let old_end = members.last().map_or(0.0, |l| from_first(l.end));
+        let trail_space = if members.last().is_some_and(|l| l.text.ends_with(paragraph_separator)) { space } else { 0.0 };
+        let new_end = underlines.last().map_or(old_end, |(_, x1, _)| x1 * k + trail_space);
+        let shift = if in_place && wrapped.len() == members.len() { new_end - old_end } else { 0.0 };
+        move_lines(&lines, &chain, [shift * u[0], shift * u[1]], &mut inserts);
+    }
     // Text shown earlier in the same text object stays first: the paragraph then goes where it
     // was, between two halves of the text object, so it keeps its place in reading order.
     let start = first.ops.first().copied().unwrap_or(o.bt_op);
@@ -1349,7 +1736,10 @@ pub fn rewrite_block(doc: &mut Document, page: usize, block: usize, text: Option
     }
     let at = if split { start } else { o.bt_op };
     let new_data = splice(&pieces, &ops, |i| {
-        let insert = if i == at { std::mem::take(&mut block_ops) } else { Vec::new() };
+        let mut insert = inserts.take(i);
+        if i == at {
+            insert.extend(std::mem::take(&mut block_ops));
+        }
         (insert, !drop.contains(&i))
     });
     let contents = rewritten_contents(doc, &streams, new_data);
