@@ -2,8 +2,12 @@
 
 This is a fork of [PdfCraft](https://github.com/storytold/pdfcraft), the open-source PDF application
 written in Rust by the ArtCraft team and the PdfCraft contributors. It was forked from commit
-`5d59060` (PdfCraft 0.5.0) on 2026-10-10. It is **not** an official PdfCraft release and is not
-endorsed by the ArtCraft team.
+`5d59060` (PdfCraft 0.5.0) on 2026-10-10 and merged with PdfCraft's `main` at `bbbe600`
+(PdfCraft 0.6.0) on 2026-10-13. It is **not** an official PdfCraft release and is not endorsed
+by the ArtCraft team.
+
+The fork lives at https://github.com/ihylnsk-cmd/CabanillasPDF on the branch `fork`; `main` there
+is PdfCraft as published. `git diff main...fork` shows what this build changes.
 
 PdfCraft's own README, with its full feature list, is in the
 [PdfCraft repository](https://github.com/storytold/pdfcraft#readme).
@@ -39,56 +43,43 @@ must sit beside the program (`pdfcraft.exe` and `models` in the same folder), an
 
 ## What this build changes
 
-Everything in the table except Windows printing already existed in PdfCraft. This build adds and
-fixes the following.
+Everything in the table exists in PdfCraft itself. This build fixes and adds the following.
 
-1. **Printing on Windows.** PdfCraft printed through CUPS only (Linux, macOS). This build lists
-   Windows printers and prints to them, with copies, collation, two-sided, colour or grayscale,
-   page ranges and mixed page sizes and orientations. Pages are rendered at the printer's
-   resolution (up to 600 dpi) and sent as images. New crate `crates/winspool` holds the Windows
-   calls; `crates/print/src/win_spool.rs` renders and sends the sheets. Printing runs in the
-   background, so the window stays responsive.
-2. **Editing text on lines that mix fonts.** PdfCraft treats each change of font on a line (a bold
+1. **Editing text on lines that mix fonts.** PdfCraft treats each change of font on a line (a bold
    name, a word in italics) as a separate piece. Editing one piece left the others where they
    were, so longer text was set over what followed it, and a paragraph that opened after a bold
    name was re-wrapped with every line starting where the first one did. In this build the pieces
    after the edited one move with its end, the space between pieces is kept, and a paragraph
    whose first line starts somewhere else (after a lead-in, indented, or hanging) keeps its own
    left edge and width (`crates/edit/src/text.rs`).
-3. **Edited text keeps the document's typeface.** When the text you type needs letters that the
+2. **Edited text keeps the document's typeface.** When the text you type needs letters that the
    PDF's embedded font does not contain (most PDFs embed only the letters they use), PdfCraft fell
    back to a built-in Helvetica, Times or Courier lookalike. This build first looks for the same
    family among the fonts installed on the computer, then for a metric-compatible one (Arial and
    Liberation Sans, Calibri and Carlito, and so on), and embeds only the letters used
    (`crates/edit/src/sysfont.rs`). TrueType fonts only; otherwise the old fallback applies.
-4. **Redaction patterns no longer miss numbers that sit next to other numbers.** In tables and
+3. **Redaction patterns no longer miss numbers that sit next to other numbers.** In tables and
    lists the phone-number pattern joined a number with the digits of the next cell and skipped
    both, and the card-number pattern did the same. Fixed in `crates/redact/src/patterns.rs`.
-5. **Signature pictures can be phone photos.** PdfCraft accepted pictures up to 4 megapixels and
+4. **Signature pictures can be phone photos.** PdfCraft accepted pictures up to 4 megapixels and
    cleared only near-white paper, so a phone photo was refused and a scan on grey paper kept a
    grey box. This build reads pictures up to 50 megapixels, shrinks them, measures the paper
    where it is (grey paper, uneven light, the shadow of the phone), makes it transparent, drops
    what lies away from the signature (the edge of the sheet, the desk) and crops to the ink
    (`crates/engine/src/signature_paper.rs`). Pictures that already have a transparent background
    are only cropped.
-6. **A short line no longer pulls in the first line of the paragraph below it** when text is
+5. **A short line no longer pulls in the first line of the paragraph below it** when text is
    grouped into paragraphs for editing (`crates/edit/src/text.rs`).
-7. **ArtCraft branding removed**, as PdfCraft's brand terms require of modified versions: the
+6. **ArtCraft branding removed**, as PdfCraft's brand terms require of modified versions: the
    ArtCraft logos, the Discord button and the community links are gone, and About says
    "Modified build". The app no longer checks PdfCraft's releases for updates (an update would
    replace this build with the official one), so it makes no network connections of its own.
    The program is still called PdfCraft; rename it before distributing it widely if it should
    not be confused with the original.
 
-`pdfcraft-fork-0.5.0.patch` (delivered with this source) is every change as one patch. To put
-the fork on GitHub: fork storytold/pdfcraft there, clone your fork, then
-
-```
-git checkout -b fork 5d59060
-git apply --index pdfcraft-fork-0.5.0.patch
-git commit -m "Fork: Windows printing, text editing, redaction and signature fixes"
-git push -u origin fork
-```
+**Printing on Windows is PdfCraft's own.** The first version of this fork (commit `a5bdbe9`) was
+made before PdfCraft could print on Windows and carried its own printing code. PdfCraft 0.6.0
+prints on Windows itself, and since the merge this build uses that and nothing else.
 
 ## Limits worth knowing
 
@@ -103,7 +94,12 @@ git push -u origin fork
   either, a built-in lookalike is used and spacing on a mixed-font line is approximate.
 - Text in scanned pages is a picture. Run **Scan & OCR** first to search it or to find text to
   redact; marking an area by hand works without it.
-- Windows printing sends pages as images, so long documents make large print jobs.
+- Printing on Windows runs a PowerShell script that renders each page with Windows' built-in
+  PDF component and sends it to the printer as an image. It needs PowerShell (part of Windows 10
+  and 11); where PowerShell is blocked, the Print dialog offers only Save as PDF. A page can
+  print slightly differently from how it looks on screen, and long documents make large jobs.
+- Edit text before you redact. A redaction box stays where it was drawn, so re-wrapping a
+  paragraph afterwards moves the text under it. The redacted text itself is gone either way.
 
 ## Building
 
@@ -134,29 +130,33 @@ The installer recipes under `packaging/` are PdfCraft's and were not used; see
 
 ## Tested, and not tested
 
-Tested, on Linux and (the Windows programs) under Wine:
+Tested after the merge with PdfCraft 0.6.0, on Linux and (the Windows programs) under Wine:
 
-- The six needs above, through the app's window and through `pdfcraft-cli`, on documents made
-  by LibreOffice, Chrome, pdfLaTeX, reportlab and fpdf2. Saved files were checked with qpdf and
-  Poppler; redacted text was confirmed absent from the saved files with two independent text
-  extractors.
+- Editing text, filling forms, adding a signature picture, searching and redacting, through the
+  app's window and through `pdfcraft-cli`, on documents made by LibreOffice, Chrome, pdfLaTeX,
+  reportlab and fpdf2. Saved files were checked with qpdf and Poppler; redacted text was
+  confirmed absent from the saved files with two independent text extractors.
 - Text edits: 58 line edits across eight documents, each compared pixel by pixel with the
   original outside the edited row (57 identical; the other is a rotated page that the
   comparison itself does not handle, checked by eye). Mixed-font lines and paragraphs after a
   bold lead-in, edited in the Windows app and read back from the saved file.
+- Printing on Linux, from the app to a virtual CUPS printer.
 - No network use: the Linux app was traced for twenty seconds with a document open and opened
   no network sockets.
-- Windows printing against a virtual printer through Wine's print system: page count, orientation,
-  mixed page sizes, copies, grayscale, and printing from the app's Print dialog.
 - Signature pictures: twelve synthetic photos and scans (12-megapixel phone photos, grey paper,
   soft and hard shadows, a desk around the sheet, ruled paper, pencil, marker, low light).
 - The automated tests of every crate that was changed, and the lints PdfCraft requires.
 
 Not tested:
 
-- **A real Windows computer and real printers.** Wine's print system is not a printer driver.
-  Print a test page on each kind of printer in use (especially label and large-format printers,
-  and two-sided printing) before relying on it.
+- **Printing on Windows, at all.** It needs PowerShell and Windows' PDF component, which Wine
+  does not have: under Wine the app finds no printers and offers only Save as PDF. PdfCraft's
+  tests that run the print script only run on Windows, so they did not run here either; only
+  the two that check how the printer list is read and how a job is handed to the script did.
+  No page has been printed from this build on Windows. Print a test page on each kind of
+  printer in use (especially label and large-format printers, and two-sided printing) before
+  relying on it.
+- A real Windows computer in general: the Windows programs were run only under Wine.
 - Real photographs of signatures: the test pictures were generated.
 - PdfCraft's full test suite: the suites for the changed areas were run, not all of the roughly
   forty window-level suites.

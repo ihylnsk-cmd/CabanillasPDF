@@ -37,9 +37,27 @@ pub(crate) fn mac_shortcuts(ctx: &egui::Context) -> bool {
     ctx.os() == egui::os::OperatingSystem::Mac
 }
 
-/// How `s` is written on this platform.
+/// How `s` is written on this platform, using the resolved current interface language.
 pub(crate) fn shortcut_label(ctx: &egui::Context, s: Shortcut) -> String {
-    s.label(mac_shortcuts(ctx))
+    let key = crate::i18n::key_name(s.key);
+    if mac_shortcuts(ctx) {
+        Shortcut { key, ..s }.label(true)
+    } else {
+        let mut parts = Vec::new();
+        if s.command || s.mac_ctrl {
+            parts.push(crate::i18n::key_name("Ctrl"));
+        }
+        if s.shift {
+            parts.push(crate::i18n::key_name("Shift"));
+        }
+        parts.push(key);
+        parts.join("+")
+    }
+}
+
+/// The command modifier for help text such as “Strg-scroll”; bindings stay in the engine.
+pub(crate) fn command_modifier_label(ctx: &egui::Context) -> &'static str {
+    if mac_shortcuts(ctx) { Shortcut::command_name(true) } else { crate::i18n::key_name("Ctrl") }
 }
 
 /// How a registered command's shortcut is written on this platform ("" without one).
@@ -124,6 +142,11 @@ impl PdfCraftApp {
         let active = self.active;
         let targets = active.map(|i| self.views[i].target_pages()).unwrap_or_default();
         match id {
+            "ui.dock.reset" => {
+                if let Err(error) = crate::docking::command(self, true, &serde_json::Value::Null) {
+                    self.notify(error);
+                }
+            }
             "file.open" => self.open_dialog(),
             "file.open_recent" => match self.recent.first().map(|r| r.path.clone()) {
                 // The palette runs commands without a submenu: open the most recent file.
@@ -235,7 +258,7 @@ impl PdfCraftApp {
                 self.quick_tool = crate::QuickTool::Comment(tool);
                 // Acrobat opens the Comments panel with the commenting tools, unless the user closed it.
                 if self.right.is_none() && !self.comments_panel_closed {
-                    self.right = Some(RightPanel::Comments);
+                    self.choose_right_panel(Some(RightPanel::Comments));
                 }
                 // A text selection made before picking a markup tool is marked right away.
                 if let (Some(kind), Some(i)) = (tool.markup(), active)
@@ -251,7 +274,7 @@ impl PdfCraftApp {
                     }
                 }
             }
-            "form.fields" => self.right = Some(RightPanel::Fields),
+            "form.fields" => self.choose_right_panel(Some(RightPanel::Fields)),
             "comment.flatten" => {
                 self.apply_edit(Edit::Flatten { comments: true, fields: false });
             }
@@ -341,7 +364,7 @@ impl PdfCraftApp {
             "edit.edit_text" => {
                 self.quick_tool = crate::QuickTool::EditText;
                 self.left = crate::LeftPanel::Tool("edit");
-                self.left_open = true;
+                self.reveal_tools();
                 self.notify_tr("Click text or an image to edit it");
             }
             "edit.advanced_search" => {
@@ -349,7 +372,7 @@ impl PdfCraftApp {
                     let f = self.views[i].find.get_or_insert_with(Default::default);
                     f.in_panel = true;
                     f.focus = true;
-                    self.right = Some(crate::RightPanel::Search);
+                    self.choose_right_panel(Some(crate::RightPanel::Search));
                 }
             }
             "a11y.report" => self.show_accessibility_report(),
@@ -359,7 +382,7 @@ impl PdfCraftApp {
             "edit.text" => {
                 self.quick_tool = crate::QuickTool::AddText;
                 self.left = crate::LeftPanel::Tool("edit");
-                self.left_open = true;
+                self.reveal_tools();
             }
             "edit.image" => self.add_image_dialog(),
             "edit.link" => {
@@ -373,7 +396,7 @@ impl PdfCraftApp {
             "redact.mark" => {
                 self.quick_tool = crate::QuickTool::Redact;
                 self.left = crate::LeftPanel::Tool("redact");
-                self.left_open = true;
+                self.reveal_tools();
                 // A text selection made first is marked right away.
                 if let Some(i) = active
                     && let Some(doc) = self.session.get(self.views[i].id)
@@ -424,7 +447,7 @@ impl PdfCraftApp {
             "comment.import" | "form.import_data" => self.import_data_dialog(),
             "comment.stamp" => {
                 self.left = crate::LeftPanel::Tool("stamp");
-                self.left_open = true;
+                self.reveal_tools();
             }
             "comment.export" => self.export_data_dialog(true, false),
             "comment.summarize" => self.dialog = Some(Dialog::SummarizeComments),
@@ -440,9 +463,9 @@ impl PdfCraftApp {
             "sign.validate" => {
                 let certs = self.session.trusted_certificates().to_vec();
                 self.session.set_trusted_certificates(certs);
-                self.right = Some(RightPanel::Signatures);
+                self.choose_right_panel(Some(RightPanel::Signatures));
             }
-            "sign.panel" => self.right = Some(RightPanel::Signatures),
+            "sign.panel" => self.choose_right_panel(Some(RightPanel::Signatures)),
             "optimize.advanced" => self.dialog = Some(Dialog::Optimize),
             "view.fit_visible" => {
                 if let Some(i) = self.active
@@ -452,6 +475,7 @@ impl PdfCraftApp {
                 }
             }
             "view.marquee_zoom" => self.quick_tool = crate::QuickTool::MarqueeZoom,
+            "edit.column_select" => self.quick_tool = crate::QuickTool::ColumnSelect,
             "edit.snapshot" => {
                 self.quick_tool = crate::QuickTool::Snapshot;
                 self.notify_tr("Drag a rectangle around the area to copy");
@@ -475,8 +499,8 @@ impl PdfCraftApp {
             "export.rtf" => self.export_office_dialog(pdfcraft_engine::compare::OfficeFormat::Rtf),
             "form.prepare" => {
                 self.left = crate::LeftPanel::Tool("form");
-                self.left_open = true;
-                self.right = Some(RightPanel::Fields);
+                self.reveal_tools();
+                self.choose_right_panel(Some(RightPanel::Fields));
                 // Like Acrobat, a document without fields gets them detected on the way in.
                 if let Some((_, id)) = self.active_ids()
                     && self.session.get(id).is_some_and(|d| d.form.is_empty() && d.editable())
@@ -508,7 +532,7 @@ impl PdfCraftApp {
                 let Some(tool) = crate::prepare::FieldTool::from_command(field) else { return false };
                 self.quick_tool = crate::QuickTool::Field(tool);
                 self.left = crate::LeftPanel::Tool("form");
-                self.left_open = true;
+                self.reveal_tools();
                 if let Some(i) = active {
                     self.views[i].forms.focus = None;
                 }
@@ -575,7 +599,9 @@ impl PdfCraftApp {
     /// Run the registered keyboard shortcuts (more specific combinations first).
     pub(crate) fn registry_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, KeyboardShortcut, Modifiers};
-        let typing = ctx.egui_wants_keyboard_input();
+        // Buttons also own keyboard focus for Tab/Enter activation, but they must not
+        // suppress document shortcuts. Text editors retain their own undo/redo handling.
+        let typing = ctx.text_edit_focused();
         // A form field's editor is open on the page: its text isn't in the document until
         // committed. (Not egui's keyboard focus: an Escape in this frame has already cleared that,
         // while the field has yet to see the Escape and discard its draft.)
@@ -616,7 +642,6 @@ impl PdfCraftApp {
 
 /// Render a top-level menu's registered commands (with live labels, shortcuts and enablement).
 pub(crate) fn registry_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui, menu: &str) {
-    let mac = mac_shortcuts(ui.ctx());
     for spec in commands::menu(menu) {
         let label = commands::current_label(spec, &app.session, app.active_ids().map(|(_, id)| id));
         let label = crate::i18n::menu_label(spec.id, &label);
@@ -653,7 +678,7 @@ pub(crate) fn registry_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui, menu: &str
             }
             continue;
         }
-        let shortcut = spec.shortcut.map(|s| s.label(mac)).unwrap_or_default();
+        let shortcut = spec.shortcut.map(|s| shortcut_label(ui.ctx(), s)).unwrap_or_default();
         let enabled = app.command_enabled(spec);
         let resp = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut));
         if resp.clicked() {
@@ -662,4 +687,33 @@ pub(crate) fn registry_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui, menu: &str
         }
     }
     let _ = widgets::menu_item;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::os::OperatingSystem;
+
+    #[test]
+    fn localized_shortcut_labels_follow_language_and_platform() {
+        let previous = crate::i18n::current();
+        let ctx = egui::Context::default();
+        for os in [OperatingSystem::Windows, OperatingSystem::Nix] {
+            ctx.set_os(os);
+            crate::i18n::set_current(crate::i18n::Lang::from_code("de").unwrap());
+            assert_eq!(shortcut_label(&ctx, Shortcut::cmd("K")), "Strg+K");
+            assert_eq!(shortcut_label(&ctx, Shortcut::cmd_shift("S")), "Strg+Umschalt+S");
+            assert_eq!(command_shortcut_label(&ctx, "view.read_mode"), "Strg+H");
+            assert_eq!(command_modifier_label(&ctx), "Strg");
+            assert_eq!(Shortcut::cmd_shift("S").label(false), "Ctrl+Shift+S", "engine/control labels keep their stable spelling");
+            crate::i18n::set_current(crate::i18n::Lang::EN);
+            assert_eq!(shortcut_label(&ctx, Shortcut::cmd_shift("S")), "Ctrl+Shift+S");
+        }
+        ctx.set_os(OperatingSystem::Mac);
+        crate::i18n::set_current(crate::i18n::Lang::from_code("de").unwrap());
+        assert_eq!(shortcut_label(&ctx, Shortcut::cmd_shift("S")), "⇧⌘S");
+        assert_eq!(command_shortcut_label(&ctx, "view.read_mode"), "⌃⌘H");
+        assert_eq!(command_modifier_label(&ctx), "⌘");
+        crate::i18n::set_current(previous);
+    }
 }

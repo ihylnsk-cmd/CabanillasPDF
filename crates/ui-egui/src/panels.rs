@@ -16,22 +16,16 @@ fn hue(g: &ToolGroup) -> Color32 {
 
 pub fn left_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
-    egui::Panel::left("tool_panel")
-        .resizable(false)
-        .exact_size(272.0)
-        .frame(
-            egui::Frame::NONE
-                .fill(t.panel)
-                .inner_margin(egui::Margin { left: 14, right: 10, top: 12, bottom: 10 })
-                .stroke(Stroke::new(1.0, t.divider)),
-        )
-        .show(ui, |ui| match app.left {
+    egui::Frame::NONE.fill(t.panel).inner_margin(egui::Margin { left: 14, right: 10, top: 12, bottom: 10 }).stroke(Stroke::new(1.0, t.divider)).show(
+        ui,
+        |ui| match app.left {
             LeftPanel::AllTools => all_tools(app, ui, &t),
             LeftPanel::Tool(id) => match catalog::group(id) {
                 Some(g) => tool_detail(app, ui, &t, g),
                 None => app.left = LeftPanel::AllTools,
             },
-        });
+        },
+    );
 }
 
 fn panel_header(ui: &mut egui::Ui, t: &Tokens, title: &str, back: bool) -> (bool, bool) {
@@ -153,6 +147,16 @@ fn tool_detail(app: &mut PdfCraftApp, ui: &mut egui::Ui, t: &Tokens, g: &'static
     }
     // Edit a PDF shows Format text at the top while text is selected or being added.
     if g.id == "edit" {
+        if app.quick_tool == crate::QuickTool::EditText {
+            let count = app.active_ids().map_or(0, |(i, _)| app.views[i].objects.count());
+            if count > 0 {
+                ui.label(crate::i18n::trn(crate::i18n::current(), count as u64, "{n} object selected", "{n} objects selected"));
+                ui.label(tl!("Drag the selection to move it. Esc clears the selection."));
+            } else {
+                ui.label(tl!("Shift-click to select several objects. Drag empty space to select an area."));
+            }
+            ui.add_space(6.0);
+        }
         format_section(app, ui, t);
     }
     let mut run = None;
@@ -414,16 +418,10 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
         let comment_allowed = doc.allows_annotation();
         // A dialog or the palette owns the keyboard: the panel leaves Escape to it.
         let modal = app.dialog.is_some() || app.palette_open;
-        egui::Panel::right("right_panel")
-            .resizable(true)
-            .default_size(330.0)
-            .size_range(260.0..=520.0)
-            .frame(
-                egui::Frame::NONE
-                    .fill(t.panel)
-                    .inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 8 })
-                    .stroke(Stroke::new(1.0, t.divider)),
-            )
+        egui::Frame::NONE
+            .fill(t.panel)
+            .inner_margin(egui::Margin { left: 14, right: 12, top: 12, bottom: 8 })
+            .stroke(Stroke::new(1.0, t.divider))
             .show(ui, |ui| {
                 let (title, count) = match panel {
                     RightPanel::Comments => ("Comments", Some(crate::comments_panel::count(info))),
@@ -552,6 +550,9 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                         }
                         for (i, item) in info.outline.iter().enumerate() {
                             outline_item(ui, &t, info, item, &[i], info.outline.len(), &mut ctx);
+                        }
+                        if info.outline_more {
+                            ui.label(tl!("Some bookmarks are not shown here: the panel lists a limited number, nested a limited depth."));
                         }
                     }
                     RightPanel::Pages => pages(ui, &t, info, view, modal, bm_editable, &mut nav),
